@@ -1,0 +1,21 @@
+# 生产配置与凭据
+config.json
+.env
+.env.*
+!.env.example
+
+# 运行时数据
+data/
+images/
+image_thumbnails/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 操作系统与编辑器
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,6 @@
+{
+  "storage_backend": "json",
+  "base_url": "",
+  "image_account_concurrency": 1,
+  "image_parallel_generation": false
+}

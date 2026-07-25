@@ -1,0 +1,16 @@
+services:
+  chatgpt2api:
+    build: .
+    container_name: chatgpt2api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8088:80"
+    environment:
+      STORAGE_BACKEND: json
+      CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:?请在 .env 中设置管理员密钥}
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - chatgpt2api-data:/app/data
+
+volumes:
+  chatgpt2api-data:
