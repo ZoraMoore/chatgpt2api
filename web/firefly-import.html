@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Adobe 账号导入 · chatgpt2api</title>
+<style>
+  :root {
+    --bg: #fafaf9; --panel: #ffffff; --border: #e7e5e4; --text: #1c1917;
+    --muted: #78716c; --accent: #1c1917; --accent-text: #fafaf9;
+    --ok: #15803d; --warn: #b45309; --err: #b91c1c; --chip: #f5f5f4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1917; --panel: #262322; --border: #3a3532; --text: #f5f5f4;
+      --muted: #a8a29e; --accent: #f5f5f4; --accent-text: #1c1917;
+      --ok: #4ade80; --warn: #fbbf24; --err: #f87171; --chip: #302c2a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 28px 20px 64px; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h2 { font-size: 15px; margin: 0 0 14px; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 22px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 18px; margin-bottom: 18px;
+  }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+  input, textarea, select {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--bg); color: var(--text); font-size: 13px; font-family: inherit;
+  }
+  textarea { resize: vertical; min-height: 62px; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  input:focus, textarea:focus { outline: 2px solid var(--muted); outline-offset: -1px; }
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .grid .full { grid-column: 1 / -1; }
+  button {
+    padding: 8px 16px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); font-size: 13px; cursor: pointer; font-family: inherit;
+  }
+  button:hover { border-color: var(--muted); }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+  .row > div { flex: 1 1 240px; }
+  .stats { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 18px; }
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 16px; min-width: 96px; }
+  .stat b { display: block; font-size: 19px; font-weight: 600; }
+  .stat span { font-size: 12px; color: var(--muted); }
+  .table-scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .chip { display: inline-block; padding: 1px 8px; border-radius: 6px; background: var(--chip); font-size: 12px; }
+  .chip.ok { color: var(--ok); } .chip.warn { color: var(--warn); } .chip.err { color: var(--err); }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--muted); }
+  .msg { padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; font-size: 13px; display: none; white-space: pre-wrap; }
+  .msg.show { display: block; }
+  .msg.ok { background: color-mix(in srgb, var(--ok) 12%, transparent); color: var(--ok); }
+  .msg.err { background: color-mix(in srgb, var(--err) 12%, transparent); color: var(--err); }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 5px; }
+  .editor { display: none; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-top: 8px; }
+  .editor.show { display: block; }
+  .empty { color: var(--muted); text-align: center; padding: 28px; font-size: 13px; }
+  a { color: inherit; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Adobe 账号导入</h1>
+  <p class="sub">
+    导入的账号以 <code>source_type=adobe</code> 落入 chatgpt2api 号池，可在
+    <a href="/accounts">号池管理</a> 页看到状态、额度与生图数量；出图用 <code>firefly-*</code> 模型。
+  </p>
+
+  <div id="msg" class="msg"></div>
+
+  <div class="panel">
+    <div class="row">
+      <div>
+        <label for="authKey">管理密钥（config.json 里的 auth-key）</label>
+        <input id="authKey" type="password" placeholder="dev-xxxxxxxx" autocomplete="off">
+      </div>
+      <button id="reloadBtn" class="primary">加载号池</button>
+    </div>
+    <div class="hint">密钥只存在本机浏览器的 localStorage，用于调用管理接口。</div>
+  </div>
+
+  <div class="stats" id="stats"></div>
+
+  <div class="panel">
+    <h2>添加账号</h2>
+    <div class="grid">
+      <div class="full">
+        <label for="deviceToken">device_token（FireflyAndroid 长期凭证，用它自动换 access_token）</label>
+        <textarea id="deviceToken" placeholder="eyJ..."></textarea>
+      </div>
+      <div class="full">
+        <label for="arpSessionId">x-arp-session-id（Adobe 风控指纹包，<b style="color:var(--err)">必填</b>）</label>
+        <textarea id="arpSessionId" placeholder="eyJzaWQiOiIyMjdkNTc3MS1..."></textarea>
+        <div class="hint">
+          base64 的 JSON，含 Arkose（ark / ftr）与 FingerprintJS（fpjs）指纹，从 firefly.adobe.com
+          出图请求头里抓。有时效，失效后在下方账号列表里替换即可。
+        </div>
+      </div>
+      <div class="full">
+        <label for="accessToken">access_token（可选；填了就不走 device_token 换票）</label>
+        <textarea id="accessToken" placeholder="eyJhbGciOi..."></textarea>
+      </div>
+      <div class="full">
+        <label for="sessionCookies">session_cookies（可选；Adobe SSO Cookie 串，作为续期备份途径）</label>
+        <textarea id="sessionCookies" placeholder="s_ecid=...; ftr_ncd=...; ..."></textarea>
+      </div>
+      <div>
+        <label for="deviceId">device_id（可选）</label>
+        <input id="deviceId" placeholder="换票时附带的设备标识">
+      </div>
+      <div>
+        <label for="clientId">client_id（可选）</label>
+        <input id="clientId" placeholder="默认 clio-playground-web">
+      </div>
+      <div>
+        <label for="quota">额度（可出图张数）</label>
+        <input id="quota" type="number" min="0" value="100">
+      </div>
+      <div>
+        <label for="proxy">代理（可选）</label>
+        <input id="proxy" placeholder="http://user:pass@host:port">
+      </div>
+    </div>
+    <div style="margin-top:16px">
+      <button id="submitBtn" class="primary">导入</button>
+      <button id="clearBtn">清空表单</button>
+    </div>
+    <div class="hint">
+      导入时会自动换票、调 <code>/ims/profile</code> 校验、检查 <code>firefly_api</code> /
+      <code>creative_production</code> scope，缺 scope 的账号会直接标成「异常」。
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>号池里的 Adobe 账号</h2>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>邮箱</th><th>状态</th><th>额度</th><th>成功</th><th>失败</th>
+            <th>在途</th><th>凭证</th><th>x-arp-session-id</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <div id="empty" class="empty">还没有加载，或号池里没有 Adobe 账号。</div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const KEY_STORE = "chatgpt2api-firefly-admin-key";
+  const $ = (id) => document.getElementById(id);
+  const authKey = $("authKey");
+  const msg = $("msg");
+  let items = [];
+
+  authKey.value = localStorage.getItem(KEY_STORE) || "";
+  authKey.addEventListener("change", () => localStorage.setItem(KEY_STORE, authKey.value.trim()));
+
+  function notify(text, ok) {
+    msg.textContent = text;
+    msg.className = "msg show " + (ok ? "ok" : "err");
+    if (ok) setTimeout(() => { msg.className = "msg"; }, 6000);
+  }
+
+  async function api(path, options) {
+    const key = authKey.value.trim();
+    if (!key) throw new Error("请先填管理密钥");
+    localStorage.setItem(KEY_STORE, key);
+    const init = Object.assign({ headers: {} }, options || {});
+    init.headers = Object.assign({ Authorization: "Bearer " + key }, init.headers);
+    if (init.body !== undefined) {
+      init.headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(init.body);
+    }
+    const response = await fetch(path, init);
+    const text = await response.text();
+    let data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { error: text }; }
+    if (!response.ok) {
+      const detail = data.detail || data;
+      throw new Error(detail.error || detail.message || ("HTTP " + response.status));
+    }
+    return data;
+  }
+
+  function statusChip(status) {
+    const cls = status === "正常" ? "ok" : (status === "限流" ? "warn" : (status === "异常" ? "err" : ""));
+    const chip = document.createElement("span");
+    chip.className = "chip " + cls;
+    chip.textContent = status || "-";
+    return chip;
+  }
+
+  function cell(row, text) {
+    const td = document.createElement("td");
+    td.textContent = text === undefined || text === null || text === "" ? "-" : String(text);
+    row.appendChild(td);
+    return td;
+  }
+
+  function renderStats(stats) {
+    const box = $("stats");
+    box.innerHTML = "";
+    const fields = [
+      ["账号", stats.total], ["可用", stats.active], ["限流", stats.limited],
+      ["异常", stats.abnormal], ["剩余额度", stats.total_quota],
+      ["累计出图", stats.total_success], ["失败", stats.total_fail], ["在途", stats.inflight],
+    ];
+    for (const [name, value] of fields) {
+      const item = document.createElement("div");
+      item.className = "stat";
+      const strong = document.createElement("b");
+      strong.textContent = value === undefined ? "-" : value;
+      const span = document.createElement("span");
+      span.textContent = name;
+      item.append(strong, span);
+      box.appendChild(item);
+    }
+  }
+
+  function renderRows() {
+    const body = $("rows");
+    body.innerHTML = "";
+    $("empty").style.display = items.length ? "none" : "block";
+
+    items.forEach((item) => {
+      const row = document.createElement("tr");
+      cell(row, item.email);
+      const statusTd = document.createElement("td");
+      statusTd.appendChild(statusChip(item.status));
+      row.appendChild(statusTd);
+      cell(row, item.quota);
+      cell(row, item.success);
+      cell(row, item.fail);
+      cell(row, item.image_inflight);
+
+      const credTd = document.createElement("td");
+      credTd.className = "mono";
+      const creds = [];
+      if (item.has_device_token) creds.push("device_token");
+      if (item.has_session_cookies) creds.push("cookies");
+      credTd.textContent = creds.length ? creds.join(" + ") : "仅 access_token";
+      row.appendChild(credTd);
+
+      const arpTd = document.createElement("td");
+      arpTd.className = "mono";
+      arpTd.textContent = item.has_arp_session_id ? item.arp_session_id_preview + "…" : "未设置";
+      row.appendChild(arpTd);
+
+      const actionTd = document.createElement("td");
+      const editBtn = document.createElement("button");
+      editBtn.textContent = "编辑";
+      const delBtn = document.createElement("button");
+      delBtn.textContent = "删除";
+      delBtn.style.marginLeft = "6px";
+      actionTd.append(editBtn, delBtn);
+      row.appendChild(actionTd);
+      body.appendChild(row);
+
+      // 展开式编辑行：替换 arp / 补 device_token / 改额度。
+      const editorRow = document.createElement("tr");
+      const editorTd = document.createElement("td");
+      editorTd.colSpan = 9;
+      editorTd.style.padding = "0 10px 10px";
+      const editor = document.createElement("div");
+      editor.className = "editor";
+      editor.innerHTML =
+        '<div class="grid">' +
+        '  <div class="full"><label>x-arp-session-id（留空则不改；必填，不能清空）</label><textarea data-f="arp_session_id"></textarea></div>' +
+        '  <div class="full"><label>device_token（留空则不改；改动后下次续期生效）</label><textarea data-f="device_token"></textarea></div>' +
+        '  <div><label>额度</label><input type="number" min="0" data-f="quota"></div>' +
+        '  <div><label>状态</label><select data-f="status">' +
+        '    <option value="正常">正常</option><option value="限流">限流</option>' +
+        '    <option value="异常">异常</option><option value="禁用">禁用</option></select></div>' +
+        '  <div><label>代理</label><input data-f="proxy"></div>' +
+        '</div><div style="margin-top:12px"><button class="primary" data-save>保存</button></div>';
+      editorTd.appendChild(editor);
+      editorRow.appendChild(editorTd);
+      body.appendChild(editorRow);
+
+      editor.querySelector('[data-f="quota"]').value = item.quota ?? 0;
+      editor.querySelector('[data-f="status"]').value = item.status || "正常";
+      editor.querySelector('[data-f="proxy"]').value = item.proxy || "";
+
+      editBtn.addEventListener("click", () => editor.classList.toggle("show"));
+
+      editor.querySelector("[data-save]").addEventListener("click", async (event) => {
+        const button = event.currentTarget;
+        button.disabled = true;
+        try {
+          const payload = { access_token: item.access_token };
+          payload.quota = Number(editor.querySelector('[data-f="quota"]').value || 0);
+          payload.status = editor.querySelector('[data-f="status"]').value;
+          payload.proxy = editor.querySelector('[data-f="proxy"]').value.trim();
+          // arp / device_token 留空表示不改，只有填了才提交。
+          const arp = editor.querySelector('[data-f="arp_session_id"]').value.trim();
+          if (arp) payload.arp_session_id = arp;
+          const deviceToken = editor.querySelector('[data-f="device_token"]').value.trim();
+          if (deviceToken) payload.device_token = deviceToken;
+          const data = await api("/api/accounts/firefly/update", { method: "POST", body: payload });
+          items = data.items || [];
+          renderStats(data.stats || {});
+          renderRows();
+          notify("已保存", true);
+        } catch (error) {
+          notify("保存失败：" + error.message, false);
+        } finally {
+          button.disabled = false;
+        }
+      });
+
+      delBtn.addEventListener("click", async () => {
+        if (!confirm("确定从号池删除这个账号？device_token 会一并丢失。")) return;
+        try {
+          await api("/api/accounts", { method: "DELETE", body: { tokens: [item.access_token] } });
+          notify("已删除", true);
+          await load();
+        } catch (error) {
+          notify("删除失败：" + error.message, false);
+        }
+      });
+    });
+  }
+
+  async function load() {
+    const data = await api("/api/accounts/firefly");
+    items = data.items || [];
+    renderStats(data.stats || {});
+    renderRows();
+    return data;
+  }
+
+  $("reloadBtn").addEventListener("click", async () => {
+    try {
+      const data = await load();
+      notify("已加载 " + (data.items || []).length + " 个 Adobe 账号；可用模型：" + (data.models || []).join(", "), true);
+    } catch (error) {
+      notify("加载失败：" + error.message, false);
+    }
+  });
+
+  $("clearBtn").addEventListener("click", () => {
+    ["deviceToken", "arpSessionId", "accessToken", "sessionCookies", "deviceId", "clientId", "proxy"]
+      .forEach((id) => { $(id).value = ""; });
+    $("quota").value = 100;
+  });
+
+  $("submitBtn").addEventListener("click", async () => {
+    const account = {
+      device_token: $("deviceToken").value.trim(),
+      arp_session_id: $("arpSessionId").value.trim(),
+      access_token: $("accessToken").value.trim(),
+      session_cookies: $("sessionCookies").value.trim(),
+      device_id: $("deviceId").value.trim(),
+      client_id: $("clientId").value.trim(),
+      proxy: $("proxy").value.trim(),
+      quota: Number($("quota").value || 0),
+    };
+    if (!account.arp_session_id) {
+      notify("x-arp-session-id 是必填项", false);
+      return;
+    }
+    if (!account.device_token && !account.access_token && !account.session_cookies) {
+      notify("device_token、access_token、session_cookies 至少填一个", false);
+      return;
+    }
+    const button = $("submitBtn");
+    button.disabled = true;
+    button.textContent = "导入中…";
+    try {
+      const data = await api("/api/accounts/firefly/import", { method: "POST", body: { accounts: [account] } });
+      items = data.items || [];
+      renderStats((await api("/api/accounts/firefly")).stats || {});
+      renderRows();
+      const failures = (data.errors || []).map((e) => e.error).join("; ");
+      notify("新增 " + (data.added || 0) + " 个，更新 " + (data.skipped || 0) + " 个" + (failures ? "；失败：" + failures : ""), !failures);
+      if (!failures) $("clearBtn").click();
+    } catch (error) {
+      notify("导入失败：" + error.message, false);
+    } finally {
+      button.disabled = false;
+      button.textContent = "导入";
+    }
+  });
+
+  if (authKey.value) $("reloadBtn").click();
+})();
+</script>
+</body>
+</html>

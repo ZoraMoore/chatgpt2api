@@ -11,12 +11,13 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 from services.auth_service import auth_service
 
 from api.support import (
+    BASE_DIR,
     require_admin,
     sanitize_cpa_pool,
     sanitize_cpa_pools,
@@ -25,6 +26,8 @@ from api.support import (
 )
 from services.account_service import account_service
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
+from services.firefly import models as firefly_models
+from services.firefly import pool as firefly_pool
 from services.oauth_login_service import OAuthLoginError, oauth_login_service
 from services.sub2api_service import (
     complete_remote_login_2fa as sub2api_complete_remote_login_2fa,
@@ -115,6 +118,39 @@ class Sub2APIImportRequest(BaseModel):
 
 class Sub2APILogin2FARequest(BaseModel):
     totp_code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+class FireflyAccountItem(BaseModel):
+    """一条 Adobe 凭证。access_token / device_token / session_cookies 至少给一个。
+
+    arp_session_id 对应出图请求头 x-arp-session-id（Adobe 风控指纹包），可留空。
+    """
+    access_token: str = ""
+    device_token: str = ""
+    device_id: str = ""
+    session_cookies: str = ""
+    arp_session_id: str = ""
+    client_id: str = ""
+    email: str = ""
+    proxy: str = ""
+    quota: int | None = None
+
+
+class FireflyImportRequest(BaseModel):
+    accounts: list[FireflyAccountItem] = Field(default_factory=list, max_length=200)
+
+
+class FireflyUpdateRequest(BaseModel):
+    """更新已有 Adobe 账号；只提交需要改动的字段，空字符串表示清空。"""
+    access_token: str = ""
+    arp_session_id: str | None = None
+    device_token: str | None = None
+    session_cookies: str | None = None
+    device_id: str | None = None
+    client_id: str | None = None
+    proxy: str | None = None
+    status: str | None = None
+    quota: int | None = None
 
 
 class OAuthLoginStartRequest(BaseModel):
@@ -407,6 +443,66 @@ def create_router() -> APIRouter:
             "errors": refresh_result.get("errors", []),
             "items": refresh_result.get("items", add_result.get("items", [])),
         }
+
+    @router.get("/api/accounts/firefly")
+    async def list_firefly_accounts(authorization: str | None = Header(default=None)):
+        """号池里的 Adobe 账号（含生图数量、剩余额度；凭证字段已脱敏）。"""
+        require_admin(authorization)
+        return {
+            "items": await run_in_threadpool(firefly_pool.list_accounts),
+            "stats": await run_in_threadpool(firefly_pool.stats),
+            "models": firefly_models.list_model_names(),
+        }
+
+    @router.post("/api/accounts/firefly/import")
+    async def import_firefly_accounts(
+            body: FireflyImportRequest,
+            authorization: str | None = Header(default=None),
+    ):
+        """导入 Adobe 账号：换票 + /ims/profile 校验后落号池（source_type=adobe）。"""
+        require_admin(authorization)
+        items = [item.model_dump(mode="python") for item in body.accounts]
+        if not items:
+            raise HTTPException(status_code=400, detail={"error": "accounts is required"})
+        result = await run_in_threadpool(firefly_pool.import_accounts, items)
+        if not result.get("added") and not result.get("skipped") and result.get("errors"):
+            raise HTTPException(status_code=400, detail={"error": result["errors"][0]["error"], "errors": result["errors"]})
+        return result
+
+    @router.post("/api/accounts/firefly/update")
+    async def update_firefly_account(
+            body: FireflyUpdateRequest,
+            authorization: str | None = Header(default=None),
+    ):
+        """更新 Adobe 账号的 x-arp-session-id / device_token / 额度等字段。"""
+        require_admin(authorization)
+        updates = body.model_dump(mode="python", exclude_none=True)
+        access_token = str(updates.pop("access_token", "") or "").strip()
+        if not access_token:
+            raise HTTPException(status_code=400, detail={"error": "access_token is required"})
+        try:
+            item = await run_in_threadpool(firefly_pool.update_credentials, access_token, updates)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        return {
+            "item": item,
+            "items": await run_in_threadpool(firefly_pool.list_accounts),
+            "stats": await run_in_threadpool(firefly_pool.stats),
+        }
+
+    @router.get("/firefly-import", include_in_schema=False)
+    async def firefly_import_page():
+        """Adobe 账号导入页。
+
+        号池管理的前端是预编译产物、没有源码，这里用一个自带表单的静态页补上
+        device_token / x-arp-session-id 的录入入口。
+        """
+        page = BASE_DIR / "web" / "firefly-import.html"
+        if not page.is_file():
+            raise HTTPException(status_code=404, detail={"error": "firefly import page not found"})
+        return FileResponse(page, media_type="text/html; charset=utf-8")
 
     @router.get("/api/cpa/pools")
     async def list_cpa_pools(authorization: str | None = Header(default=None)):

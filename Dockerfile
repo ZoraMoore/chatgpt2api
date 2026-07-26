@@ -19,6 +19,7 @@ COPY services ./services
 COPY utils ./utils
 COPY scripts ./scripts
 COPY web_dist ./web_dist
+COPY web ./web
 COPY main.py VERSION ./
 RUN mkdir -p /app/data
 

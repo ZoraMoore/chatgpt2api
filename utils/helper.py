@@ -23,6 +23,8 @@ PREFIXED_CODEX_IMAGE_MODELS = {
 }
 IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
 PUBLIC_IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
+# Adobe Firefly 反代模型统一带此前缀（如 firefly-gpt-image-2），前缀即 provider 路由依据。
+FIREFLY_MODEL_PREFIX = "firefly-"
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
@@ -121,7 +123,14 @@ def split_image_model(model: object) -> tuple[str | None, str | None]:
     return None, None
 
 
+def is_firefly_image_model(model: object) -> bool:
+    """Adobe Firefly 反代模型（firefly- 前缀）。具体别名由 services.firefly.models 校验。"""
+    return str(model or "").strip().lower().startswith(FIREFLY_MODEL_PREFIX)
+
+
 def is_supported_image_model(model: object) -> bool:
+    if is_firefly_image_model(model):
+        return True
     _, base_model = split_image_model(model)
     return base_model is not None
 

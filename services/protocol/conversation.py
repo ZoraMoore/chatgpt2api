@@ -24,6 +24,7 @@ from utils.helper import (
     IMAGE_MODELS,
     extract_image_from_message_content,
     is_codex_image_model,
+    is_firefly_image_model,
     is_supported_image_model,
     split_image_model,
 )
@@ -1253,6 +1254,12 @@ def _generate_single_image(
     该函数在独立线程中运行，每个线程使用不同的账号，
     实现并行生图，避免串行超时阻塞。
     """
+    # Adobe Firefly 反代：走独立 provider（自己选号、计数），其余调度行为与本函数一致。
+    if is_firefly_image_model(request.model):
+        from services.firefly.provider import generate_single_image as generate_firefly_image
+
+        return generate_firefly_image(request, index, total)
+
     # 模型返回文本而非图片的最大重试次数
     MAX_TEXT_REPLY_RETRIES = 3
     # TLS 连接错误最大重试次数
@@ -1492,7 +1499,10 @@ def _generate_single_image(
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
     """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。"""
     if not is_supported_image_model(request.model):
-        raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
+        from services.firefly.models import list_model_names as list_firefly_model_names
+
+        supported = sorted(IMAGE_MODELS) + list_firefly_model_names()
+        raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(supported))
 
     if request.n <= 1:
         # 单张图片，直接执行（无需线程池开销）

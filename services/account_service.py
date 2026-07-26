@@ -434,6 +434,66 @@ class AccountService:
         )
         return new_token
 
+    @classmethod
+    def _is_firefly_account(cls, account: dict | None) -> bool:
+        """Adobe Firefly 账号（source_type=adobe）走 IMS 凭证体系，不能用 OpenAI 的刷新链路。"""
+        from services.firefly import SOURCE_TYPE as FIREFLY_SOURCE_TYPE
+
+        return cls._normalize_source_type((account or {}).get("source_type")) == FIREFLY_SOURCE_TYPE
+
+    def _refresh_firefly_access_token(self, access_token: str, account: dict, *, force: bool, event: str) -> str:
+        """用 device_token / SSO Cookie 续期 Adobe IMS access_token。
+
+        Firefly 没有 OAuth refresh_token；两种凭证都不可用时保持原 token 不动，
+        由 _fetch_firefly_remote_info 负责把账号标记为异常。
+        """
+        from services.firefly import auth as firefly_auth
+        from services.firefly.constants import REFRESH_LEEWAY_SECS
+
+        active_token = str(account.get("access_token") or access_token)
+        if not force and not firefly_auth.token_expired(active_token, REFRESH_LEEWAY_SECS):
+            return active_token
+        if not force and self._recent_token_refresh_error(account):
+            return active_token
+
+        device_token = str(account.get("device_token") or "").strip()
+        session_cookies = str(account.get("session_cookies") or "").strip()
+        client_id = str(account.get("client_id") or "").strip()
+
+        try:
+            if device_token:
+                # 走完整桥接换回带 firefly_api 的 Web access（并刷新 SSO Cookie）。
+                bridged = firefly_auth.bridge_device_to_web_access(
+                    device_token,
+                    device_id=str(account.get("device_id") or ""),
+                    account=account,
+                )
+                new_token = bridged["access_token"]
+                extra_updates = {
+                    "device_token": bridged.get("device_token") or device_token,
+                    "session_cookies": bridged.get("session_cookies") or session_cookies,
+                    "client_id": bridged.get("client_id") or client_id,
+                    "scope": bridged.get("scope") or account.get("scope"),
+                }
+            elif session_cookies:
+                new_token = firefly_auth.refresh_with_cookies(
+                    session_cookies,
+                    client_id=client_id,
+                    account=account,
+                )
+                extra_updates = {}
+            else:
+                raise RuntimeError("firefly: no device_token or session_cookies for refresh")
+        except Exception as exc:
+            self._record_token_refresh_error(active_token, event, str(exc))
+            return active_token
+
+        rotated_token = self._apply_refreshed_tokens(active_token, {"access_token": new_token}, event)
+        updates = {key: value for key, value in extra_updates.items() if value}
+        updates["ims_expires_at"] = self._timestamp_to_iso(int(firefly_auth.token_expires_at(rotated_token)))
+        self.update_account(rotated_token, updates, quiet=True)
+        return rotated_token
+
     def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token") -> str:
         if not access_token:
             return ""
@@ -441,6 +501,8 @@ class AccountService:
             resolved_token, account = self._get_account_for_token(access_token)
             if not account:
                 return access_token
+            if self._is_firefly_account(account):
+                return self._refresh_firefly_access_token(resolved_token, account, force=force, event=event)
             active_token = str(account.get("access_token") or resolved_token or access_token)
             if not self._token_needs_refresh(active_token, force=force):
                 return active_token
@@ -1103,6 +1165,21 @@ class AccountService:
             payload.pop("type", None)
         if str(payload.get("export_type") or "").strip().lower() == "codex":
             payload["source_type"] = "codex"
+        # Adobe 导出件（type=adobe）或带 IMS 凭证的条目一律归入 adobe 分池，
+        # 否则会被当成 OpenAI 账号送进 ChatGPT 的刷新链路。
+        from services.firefly import SOURCE_TYPE as FIREFLY_SOURCE_TYPE
+
+        is_adobe_payload = (
+            str(payload.get("type") or "").strip().lower() == FIREFLY_SOURCE_TYPE
+            or str(payload.get("source_type") or "").strip().lower() == FIREFLY_SOURCE_TYPE
+            or bool(str(payload.get("device_token") or "").strip())
+            or bool(str(payload.get("session_cookies") or "").strip())
+        )
+        if is_adobe_payload:
+            payload["source_type"] = FIREFLY_SOURCE_TYPE
+            if str(payload.get("type") or "").strip().lower() == FIREFLY_SOURCE_TYPE:
+                # 导出格式里的 type=adobe 是来源标记，不是号池套餐类型。
+                payload["type"] = "firefly"
         if payload.get("plan_type") and not payload.get("type"):
             payload["type"] = str(payload.get("plan_type") or "").strip()
         return payload
@@ -1312,6 +1389,88 @@ class AccountService:
             return dict(account)
         return None
 
+    def _fetch_firefly_remote_info(
+        self,
+        access_token: str,
+        event: str = "fetch_remote_info",
+        defer_invalid_removal: bool = True,
+    ) -> dict[str, Any] | None:
+        """Adobe 账号的远程校验：续期 → /ims/profile → 回写资料与状态。
+
+        与 OpenAI 账号不同，这里失效只标「异常」不自动删号：device_token / SSO Cookie
+        是重新拿回账号的唯一凭证，删掉就无法恢复了。
+        """
+        from services.firefly import auth as firefly_auth
+
+        active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
+
+        def _load(token: str) -> dict:
+            _, item = self._get_account_for_token(token)
+            return item or {}
+
+        def _profile(token: str) -> dict:
+            account = _load(token)
+            return firefly_auth.fetch_profile(
+                token,
+                client_id=str(account.get("client_id") or ""),
+                account=account,
+            )
+
+        try:
+            profile = _profile(active_token)
+        except Exception as exc:
+            refreshed_token = self.refresh_access_token(
+                active_token, force=True, event=f"{event}:invalid_access_token"
+            )
+            if refreshed_token and refreshed_token != active_token:
+                try:
+                    profile = _profile(refreshed_token)
+                except Exception as retry_exc:
+                    if self._record_invalid_token_seen(
+                        refreshed_token, event, str(retry_exc), defer_invalid_removal=defer_invalid_removal
+                    ):
+                        self.update_account(refreshed_token, {"status": "异常"}, quiet=True)
+                    raise
+                active_token = refreshed_token
+            else:
+                if self._record_invalid_token_seen(
+                    active_token, event, str(exc), defer_invalid_removal=defer_invalid_removal
+                ):
+                    self.update_account(active_token, {"status": "异常"}, quiet=True)
+                raise
+
+        self._record_refresh_success(active_token)
+
+        account = _load(active_token)
+        has_scope, scope = firefly_auth.has_generate_scope(active_token)
+        # 旧账号的 access_token 可能是 device_token 直接换出的 Android access（仅 creative_sdk），
+        # 无法生图。只要还有 device_token / SSO Cookie，就强制重新桥接换出带 firefly_api 的 Web
+        # access，实现自愈——用户在号池页点一次刷新即可从「异常」恢复。
+        if not has_scope and (
+            str(account.get("device_token") or "").strip()
+            or str(account.get("session_cookies") or "").strip()
+        ):
+            rebridged = self.refresh_access_token(active_token, force=True, event=f"{event}:scope_upgrade")
+            if rebridged and rebridged != active_token:
+                active_token = rebridged
+                account = _load(active_token)
+                has_scope, scope = firefly_auth.has_generate_scope(active_token)
+        updates: dict[str, Any] = {
+            "email": str(profile.get("email") or account.get("email") or "") or None,
+            "user_id": str(profile.get("userId") or profile.get("authId") or account.get("user_id") or "") or None,
+            "type": str(profile.get("account_type") or account.get("type") or "").strip() or "firefly",
+            "scope": scope,
+            "ims_expires_at": self._timestamp_to_iso(int(firefly_auth.token_expires_at(active_token))),
+        }
+        if not has_scope:
+            # device_token 直接换出的 token 常只有 creative_sdk，生图会 403。
+            updates["status"] = "异常"
+            updates["last_refresh_error"] = "access_token 缺少 firefly_api / creative_production scope"
+            updates["last_refresh_error_at"] = datetime.now(timezone.utc).isoformat()
+        elif str(account.get("status") or "") == "异常":
+            updates["status"] = "正常"
+        return self.update_account(active_token, updates, quiet=True)
+
     def fetch_remote_info(
         self,
         access_token: str,
@@ -1320,6 +1479,10 @@ class AccountService:
     ) -> dict[str, Any] | None:
         if not access_token:
             raise ValueError("access_token is required")
+
+        _, existing_account = self._get_account_for_token(access_token)
+        if self._is_firefly_account(existing_account):
+            return self._fetch_firefly_remote_info(access_token, event, defer_invalid_removal)
 
         active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
         try:
@@ -1620,6 +1783,25 @@ class AccountService:
         items: list[dict[str, str]] = []
         for account in accounts:
             access_token = str(account.get("access_token") or "").strip()
+            if self._is_firefly_account(account):
+                # Adobe 账号没有 refresh_token/id_token，导出 IMS 凭证本身
+                # （device_token / SSO Cookie 才是重新拿回账号的关键）。
+                if not access_token:
+                    continue
+                firefly_item = {
+                    "type": "adobe",
+                    "email": str(account.get("email") or "").strip(),
+                    "account_id": str(account.get("user_id") or "").strip(),
+                    "access_token": access_token,
+                    "expired": str(account.get("ims_expires_at") or ""),
+                }
+                for key in ("device_token", "device_id", "session_cookies", "client_id"):
+                    value = str(account.get(key) or "").strip()
+                    if value:
+                        firefly_item[key] = value
+                items.append(firefly_item)
+                continue
+
             refresh_token = str(account.get("refresh_token") or "").strip()
             id_token = str(account.get("id_token") or "").strip()
             if not access_token or not refresh_token or not id_token:
