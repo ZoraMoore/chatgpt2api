@@ -66,41 +66,51 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 def test_model_routing() -> None:
     print("\n[1] 模型解析与 provider 路由")
-    check("firefly- 前缀被识别", is_firefly_image_model("firefly-gpt-image-2"))
-    check("firefly 模型属于受支持生图模型", is_supported_image_model("firefly-gemini-flash"))
-    check("firefly 模型不会被当成 codex", not is_codex_image_model("firefly-gpt-image-2"))
+    check("gpt-image- 前缀被识别", is_firefly_image_model("gpt-image-adobe-2"))
+    check("firefly 模型属于受支持生图模型", is_supported_image_model("gpt-image-gemini-flash"))
+    check("firefly 模型不会被当成 codex", not is_codex_image_model("gpt-image-adobe-2"))
+    # 与自有模型共用 gpt-image- 前缀，这两条是防止 Adobe 号池顶掉自有渠道的底线。
     check("自有 gpt-image-2 不路由到 firefly", not is_firefly_image_model("gpt-image-2"))
     check("自有 gpt-image-2 仍受支持", is_supported_image_model("gpt-image-2"))
+    check("自有 codex-gpt-image-2 不路由到 firefly", not is_firefly_image_model("codex-gpt-image-2"))
+    check("旧的 firefly- 名字已不再路由", not is_firefly_image_model("firefly-gpt-image-2"))
 
-    spec = firefly_models.resolve_model("firefly-gpt-image-2")
-    check("firefly-gpt-image-2 解析成功", spec is not None)
+    spec = firefly_models.resolve_model("gpt-image-adobe-2")
+    check("gpt-image-adobe-2 解析成功", spec is not None)
     check("解析到 gpt-image/2", bool(spec) and (spec.model_id, spec.model_version) == ("gpt-image", "2"))
-    check("别名 firefly-nano-banana 指向 gemini-flash",
-          (firefly_models.resolve_model("firefly-nano-banana") or spec).model_version == "nano-banana-3")
-    check("未知模型返回 None", firefly_models.resolve_model("firefly-not-exist") is None)
+    check("gpt-image-adobe-1.5 解析到 gpt-image/1.5",
+          (firefly_models.resolve_model("gpt-image-adobe-1.5") or spec).model_version == "1.5")
+    check("别名 gpt-image-nano-banana 指向 gemini-flash",
+          (firefly_models.resolve_model("gpt-image-nano-banana") or spec).model_version == "nano-banana-3")
+    check("未知模型返回 None", firefly_models.resolve_model("gpt-image-not-exist") is None)
 
     names = firefly_models.list_model_names()
-    check("模型名全部带 firefly- 前缀", all(name.startswith("firefly-") for name in names), str(names))
+    check("模型名全部带 gpt-image- 前缀", all(name.startswith("gpt-image-") for name in names), str(names))
+    check("对外名不与自有 gpt-image-2 撞名", "gpt-image-2" not in names, str(names))
     check("模型列表包含 6 个内置模型", len(names) == 6, str(names))
-    # 改名：对外名按实际模型命名，旧名仍作为别名兼容。
-    check("对外名含 firefly-Nano Banana 3", "firefly-Nano Banana 3" in names, str(names))
-    check("对外名含 firefly-Nano Banana Pro", "firefly-Nano Banana Pro" in names, str(names))
-    check("新名可解析到 nano-banana-3",
-          (firefly_models.resolve_model("firefly-Nano Banana 3") or spec).model_version == "nano-banana-3")
-    check("新名大小写不敏感",
-          (firefly_models.resolve_model("firefly-nano banana 3") or spec).model_version == "nano-banana-3")
-    check("新名 Pro 解析到 nano-banana-2",
-          (firefly_models.resolve_model("firefly-Nano Banana Pro") or spec).model_version == "nano-banana-2")
-    check("旧名 firefly-gemini-flash 仍兼容",
-          (firefly_models.resolve_model("firefly-gemini-flash") or spec).model_version == "nano-banana-3")
-    check("旧名 firefly-nano-banana-2 仍兼容",
-          (firefly_models.resolve_model("firefly-nano-banana-2") or spec).model_version == "nano-banana-2")
+    check("对外名含 gpt-image-Nano Banana 3", "gpt-image-Nano Banana 3" in names, str(names))
+    check("对外名含 gpt-image-Nano Banana Pro", "gpt-image-Nano Banana Pro" in names, str(names))
+    check("对外名可解析到 nano-banana-3",
+          (firefly_models.resolve_model("gpt-image-Nano Banana 3") or spec).model_version == "nano-banana-3")
+    check("对外名大小写不敏感",
+          (firefly_models.resolve_model("gpt-image-nano banana 3") or spec).model_version == "nano-banana-3")
+    check("Pro 解析到 nano-banana-2",
+          (firefly_models.resolve_model("gpt-image-Nano Banana Pro") or spec).model_version == "nano-banana-2")
+    # 对外名带空格，无空格写法必须等价，方便不便传空格的客户端。
+    check("无空格写法等价",
+          (firefly_models.resolve_model("gpt-image-nano-banana-3") or spec).model_version == "nano-banana-3")
+    check("无空格 Pro 写法等价",
+          (firefly_models.resolve_model("gpt-image-nano-banana-pro") or spec).model_version == "nano-banana-2")
+    check("别名 gpt-image-gemini-flash 可用",
+          (firefly_models.resolve_model("gpt-image-gemini-flash") or spec).model_version == "nano-banana-3")
+    check("别名 gpt-image-nano-banana-2 可用",
+          (firefly_models.resolve_model("gpt-image-nano-banana-2") or spec).model_version == "nano-banana-2")
 
 
 def test_generation_options() -> None:
     print("\n[2] OpenAI size/quality → Firefly 参数映射")
-    gpt_image = firefly_models.resolve_model("firefly-gpt-image-2")
-    gemini = firefly_models.resolve_model("firefly-gemini-flash")
+    gpt_image = firefly_models.resolve_model("gpt-image-adobe-2")
+    gemini = firefly_models.resolve_model("gpt-image-gemini-flash")
 
     options = firefly_models.resolve_generation_options(gpt_image, size="1024x1024", quality="high")
     check("1024x1024 → 1:1", options.aspect_ratio == "1:1", options.aspect_ratio)
@@ -131,14 +141,14 @@ def test_request_bodies() -> None:
     print("\n[3] generate-async 请求体形态（对齐抓包）")
     client = FireflyClient("token", account=None)
 
-    native = firefly_models.resolve_model("firefly-image5")
+    native = firefly_models.resolve_model("gpt-image-firefly-image5")
     body = client.build_body(native, "小猫", firefly_models.resolve_generation_options(native))
     check("自有模型无 modelId", "modelId" not in body)
     check("自有模型带 modelVersion=image5", body.get("modelVersion") == "image5")
     check("自有模型带 resolutionLevel", body.get("resolutionLevel") == "1MP", str(body.get("resolutionLevel")))
     check("自有模型带 prompt_reasoner", body["modelSpecificPayload"].get("prompt_reasoner") == "quality")
 
-    gpt_image = firefly_models.resolve_model("firefly-gpt-image-2")
+    gpt_image = firefly_models.resolve_model("gpt-image-adobe-2")
     options = firefly_models.resolve_generation_options(gpt_image, size="auto")
     body = client.build_body(gpt_image, "小猫", options)
     check("gpt-image auto 用 modelSpecificPayload.size=auto", body["modelSpecificPayload"].get("size") == "auto")
@@ -150,13 +160,13 @@ def test_request_bodies() -> None:
     check("gpt-image 指定比例带顶层 size", body.get("size") == {"width": 1344, "height": 768}, json.dumps(body.get("size")))
     check("gpt-image 指定比例时 payload 无 size", "size" not in body["modelSpecificPayload"])
 
-    flux = firefly_models.resolve_model("firefly-flux-pro-2")
+    flux = firefly_models.resolve_model("gpt-image-flux-pro-2")
     body = client.build_body(flux, "小猫", firefly_models.resolve_generation_options(flux, size="1024x1024"))
     check("flux modelSpecificPayload 为空对象", body["modelSpecificPayload"] == {})
     check("flux 无 groundSearch", "groundSearch" not in body)
     check("flux 带 size", body.get("size") == {"width": 1024, "height": 1024})
 
-    gemini = firefly_models.resolve_model("firefly-gemini-flash")
+    gemini = firefly_models.resolve_model("gpt-image-gemini-flash")
     options = firefly_models.resolve_generation_options(gemini, aspect_ratio="16:9", resolution="1K")
     body = client.build_body(gemini, "小狗", options, add_watermark=True, ground_search=True)
     check("gemini 带 addWatermark", body["modelSpecificPayload"]["parameters"]["addWatermark"] is True)
@@ -340,7 +350,7 @@ def test_pool_roundtrip() -> None:
     conversation.save_image_bytes = lambda data, base_url=None: "https://example.invalid/saved.png"
 
     request = ConversationRequest(
-        model="firefly-gemini-flash",
+        model="gpt-image-gemini-flash",
         prompt="一只在草地上奔跑的小狗",
         n=1,
         size="1024x1024",
@@ -351,8 +361,8 @@ def test_pool_roundtrip() -> None:
     check("产出 1 个 result 输出", len(outputs) == 1 and outputs[0].kind == "result")
     check("data 带 b64_json", bool(outputs[0].data) and "b64_json" in outputs[0].data[0])
     check("回填账号邮箱", outputs[0].account_email == "tester@example.com")
-    check("上游收到的模型正确（旧别名被规范化到新对外名）",
-          (FakeClient.last_body or {}).get("model") == "firefly-Nano Banana 3", str((FakeClient.last_body or {}).get("model")))
+    check("上游收到的模型正确（别名被规范化到对外名）",
+          (FakeClient.last_body or {}).get("model") == "gpt-image-Nano Banana 3", str((FakeClient.last_body or {}).get("model")))
     check("账号的 x-arp-session-id 传给了客户端",
           FakeClient.last_arp == "eyJzaWQiOiJmYWtlLXNlc3Npb24taWQifQ==", str(FakeClient.last_arp))
 

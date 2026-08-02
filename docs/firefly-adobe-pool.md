@@ -80,24 +80,33 @@ curl http://127.0.0.1:8088/api/accounts/firefly -H "Authorization: Bearer $CHATG
 
 ## 出图
 
-模型名统一 `firefly-` 前缀（前缀即路由依据，与自有的 `gpt-image-2` 不冲突）：
+模型名统一 `gpt-image-` 前缀（前缀即路由依据）：
 
 | 模型 | 上游 | 说明 |
 |---|---|---|
-| `firefly-image5` | image-v5 自有 | Firefly Image 5，3P 过载时的自动回退目标 |
-| `firefly-gemini-flash` | firefly-3p | Nano Banana 3 |
-| `firefly-nano-banana-2` | firefly-3p | Nano Banana Pro |
-| `firefly-gpt-image-2` | firefly-3p | GPT Image 2 |
-| `firefly-gpt-image-1.5` | firefly-3p | GPT Image 1.5 |
-| `firefly-flux-pro-2` | firefly-3p | Flux Pro 2 |
+| `gpt-image-firefly-image5` | image-v5 自有 | Firefly Image 5，3P 过载时的自动回退目标 |
+| `gpt-image-Nano Banana 3` | firefly-3p | Nano Banana 3 |
+| `gpt-image-Nano Banana Pro` | firefly-3p | Nano Banana Pro |
+| `gpt-image-adobe-2` | firefly-3p | GPT Image 2 |
+| `gpt-image-adobe-1.5` | firefly-3p | GPT Image 1.5 |
+| `gpt-image-flux-pro-2` | firefly-3p | Flux Pro 2 |
 
-别名 `firefly-nano-banana`、`firefly-gpt-image`、`firefly-flux`、`firefly-image5` 同样可用。
+为什么用 `gpt-image-` 而不是更直观的 `firefly-`：Sub2API 网关按
+`strings.HasPrefix(model, "gpt-image-")` 判定图像模型，不符合的模型请求
+`/v1/images/*` 会在网关层直接 400，根本转发不过来。
+
+两个 GPT Image 模型叫 `adobe-*` 而不是 `gpt-image-2` / `gpt-image-1.5`，是为了避开
+chatgpt2api 自有的网页版生图模型 `gpt-image-2`。同名会让 Adobe 号池顶掉自有渠道，
+因此 `utils.helper.is_firefly_image_model` 里自有模型无条件优先。
+
+对外名里的空格可以换成连字符，`gpt-image-nano-banana-3` 等价于 `gpt-image-Nano Banana 3`；
+别名 `gpt-image-gemini-flash`、`gpt-image-nano-banana-2`、`gpt-image-flux`、`gpt-image-image5` 同样可用。
 号池里有 Adobe 账号时，这些模型会自动出现在 `GET /v1/models`。
 
 ```bash
 curl -X POST http://127.0.0.1:8088/v1/images/generations \
   -H "Authorization: Bearer $USER_KEY" -H "Content-Type: application/json" \
-  -d '{"model":"firefly-gemini-flash","prompt":"一只在草地上奔跑的小狗",
+  -d '{"model":"gpt-image-Nano Banana 3","prompt":"一只在草地上奔跑的小狗",
        "n":2,"size":"1024x1024","quality":"high","response_format":"b64_json"}'
 ```
 
@@ -106,7 +115,7 @@ curl -X POST http://127.0.0.1:8088/v1/images/generations \
 ```bash
 curl -X POST http://127.0.0.1:8088/v1/images/edits \
   -H "Authorization: Bearer $USER_KEY" \
-  -F model=firefly-gemini-flash -F prompt="把背景换成雪山" -F image=@cat.png
+  -F "model=gpt-image-Nano Banana 3" -F prompt="把背景换成雪山" -F image=@cat.png
 ```
 
 参数映射（OpenAI → Firefly）：
@@ -141,7 +150,7 @@ Adobe 账号与 OpenAI 账号在同一张表里，来源列显示 `adobe`：
 - **导出**：导出为 `{"type":"adobe", access_token, device_token, device_id, session_cookies, client_id}`，
   重新导入时会被自动识别回 adobe 分池。
 - **3P 过载回退**：第三方端点返回 `system under load` 时，先按 2s/4s/8s 退避重试，仍失败则回退到
-  `firefly-image5`，再失败才换号。
+  `gpt-image-firefly-image5`，再失败才换号。
 
 ## 自测
 

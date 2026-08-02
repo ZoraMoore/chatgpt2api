@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 from curl_cffi import requests
 from fastapi import HTTPException
+from services.firefly import models as firefly_models
 from services.proxy_service import proxy_settings
 from utils.log import logger
 
@@ -23,8 +24,9 @@ PREFIXED_CODEX_IMAGE_MODELS = {
 }
 IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
 PUBLIC_IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
-# Adobe Firefly 反代模型统一带此前缀（如 firefly-gpt-image-2），前缀即 provider 路由依据。
-FIREFLY_MODEL_PREFIX = "firefly-"
+# Adobe Firefly 反代模型统一带此前缀（如 gpt-image-adobe-2），前缀即 provider 路由依据。
+# 与自有模型共用前缀是刻意为之：Sub2API 网关只放行 gpt-image- 开头的模型走 /v1/images/*。
+FIREFLY_MODEL_PREFIX = firefly_models.MODEL_PREFIX
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
@@ -124,8 +126,15 @@ def split_image_model(model: object) -> tuple[str | None, str | None]:
 
 
 def is_firefly_image_model(model: object) -> bool:
-    """Adobe Firefly 反代模型（firefly- 前缀）。具体别名由 services.firefly.models 校验。"""
-    return str(model or "").strip().lower().startswith(FIREFLY_MODEL_PREFIX)
+    """Adobe Firefly 反代模型（gpt-image- 前缀 + 已登记别名）。
+
+    Firefly 与自有图片模型共用 gpt-image- 前缀，所以这里让自有模型无条件优先，
+    避免 Adobe 号池把自有的 gpt-image-2 顶掉。
+    """
+    normalized = str(model or "").strip().lower()
+    if normalized in IMAGE_MODELS:
+        return False
+    return firefly_models.is_firefly_model(normalized)
 
 
 def is_supported_image_model(model: object) -> bool:

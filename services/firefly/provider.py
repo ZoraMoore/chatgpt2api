@@ -155,7 +155,7 @@ def generate_single_image(request: Any, index: int, total: int) -> list[Any]:
                 # 3P 过载：回退到 Firefly 自有 Image 5（与 Go 侧 fallback_native 行为一致）。
                 if not current_spec.third_party:
                     raise
-                fallback = firefly_models.resolve_model("firefly-image5")
+                fallback = firefly_models.resolve_model("gpt-image-firefly-image5")
                 if fallback is None:
                     raise
                 logger.warning({

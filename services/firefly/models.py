@@ -1,7 +1,12 @@
 """Firefly 模型表与生成参数解析。
 
-对外模型名统一带 ``firefly-`` 前缀（如 ``firefly-gpt-image-2``），避免与
-chatgpt2api 自有的 ``gpt-image-2`` 撞名；前缀同时作为 provider 路由依据。
+对外模型名统一带 ``gpt-image-`` 前缀（如 ``gpt-image-adobe-2``）。前缀不是随便取的：
+Sub2API 网关只把名字以 ``gpt-image-`` 开头的模型判定为图像模型，其余模型请求
+``/v1/images/*`` 会在网关层直接 400，根本不会转发过来。
+
+前缀同时作为 provider 路由依据。由于它与 chatgpt2api 自有的 ``gpt-image-2``
+共用命名空间，别名表必须避开自有模型名；实际路由时自有模型优先，
+见 ``utils.helper.is_firefly_image_model``。
 """
 
 from __future__ import annotations
@@ -9,7 +14,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-MODEL_PREFIX = "firefly-"
+MODEL_PREFIX = "gpt-image-"
 
 # generate-async 请求体形态（App/Web 抓包确认的四种差异）。
 BODY_KIND_NATIVE = "native"
@@ -105,7 +110,8 @@ BUILTIN_MODELS: tuple[ModelSpec, ...] = (
         default_resolution="1K",
     ),
     ModelSpec(
-        alias="gpt-image-2",
+        # 不能用 gpt-image-2：那是 chatgpt2api 自有的网页版生图模型。
+        alias="adobe-2",
         display_name="GPT Image 2",
         model_id="gpt-image",
         model_version="2",
@@ -117,7 +123,7 @@ BUILTIN_MODELS: tuple[ModelSpec, ...] = (
         default_resolution="1K",
     ),
     ModelSpec(
-        alias="gpt-image-1.5",
+        alias="adobe-1.5",
         display_name="GPT Image 1.5",
         model_id="gpt-image",
         model_version="1.5",
@@ -147,8 +153,9 @@ for _spec in BUILTIN_MODELS:
     _register(_spec.public_name, _spec)
     _register(_spec.display_name, _spec)
 
-# 简写与历史别名，方便调用方书写、且不破坏旧的模型名（改名前的 gemini-flash / nano-banana-2）。
-# _target 用新对外名的小写形式（_register 已把 key 统一小写）。
+# 简写与历史别名：既方便调用方书写，也给含空格的对外名提供无空格写法
+# （`gpt-image-nano-banana-3` 等价于 `gpt-image-Nano Banana 3`）。
+# _target 用别名的小写形式（_register 已把 key 统一小写）。
 for _short, _target in (
     ("nano-banana", "nano banana 3"),
     ("nano-banana-3", "nano banana 3"),
@@ -157,7 +164,6 @@ for _short, _target in (
     ("nano-banana-2", "nano banana pro"),
     ("nano-banana-pro", "nano banana pro"),
     ("gemini-nano-banana-2", "nano banana pro"),
-    ("gpt-image", "gpt-image-2"),
     ("flux", "flux-pro-2"),
     ("image5", "firefly-image5"),
 ):
@@ -166,7 +172,11 @@ for _short, _target in (
 
 
 def is_firefly_model(model: object) -> bool:
-    """判断模型名是否路由到 Firefly provider（必须带 firefly- 前缀）。"""
+    """判断模型名是否路由到 Firefly provider（必须带 gpt-image- 前缀且已登记别名）。
+
+    注意：自有的 gpt-image-2 同样命中前缀，靠「未登记为别名」被排除；真正的兜底
+    在 utils.helper.is_firefly_image_model，那里让自有模型无条件优先。
+    """
     normalized = str(model or "").strip().lower()
     return normalized.startswith(MODEL_PREFIX) and normalized in _ALIAS_INDEX
 
