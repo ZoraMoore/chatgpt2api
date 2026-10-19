@@ -15,6 +15,7 @@ from services.account_service import account_service
 from services.config import DATA_DIR
 from services.sub2api_session_service import (
     Sub2APISessionError,
+    get_compatible_admin_response,
     sub2api_session_manager,
 )
 
@@ -220,11 +221,12 @@ def _remote_get(server: dict, path: str, *, params: dict | None = None, api_key_
         if api_key_session is None:
             raise RuntimeError("API Key request session is missing")
         base_url = _clean(server.get("base_url")).rstrip("/")
-        response = api_key_session.get(
-            f"{base_url}{path}",
+        response = get_compatible_admin_response(
+            api_key_session,
+            base_url,
+            path,
             headers=_api_key_headers(server),
             params=params,
-            timeout=30,
         )
         if not response.ok:
             raise Sub2APISessionError(
@@ -362,8 +364,8 @@ def list_remote_groups(server: dict) -> list[dict]:
     return items
 
 
-def _fetch_access_tokens_for_accounts(server: dict, account_ids: list[str]) -> tuple[list[str], list[dict]]:
-    """Return exported access tokens and per-account errors from sub2api."""
+def _fetch_accounts_for_import(server: dict, account_ids: list[str]) -> tuple[list[dict], list[dict]]:
+    """保留受保护导出的完整凭据，不能在传给账号池之前降为 token 列表。"""
     ids = [_clean(item) for item in account_ids if _clean(item)]
     if not ids:
         return [], []
@@ -387,7 +389,7 @@ def _fetch_access_tokens_for_accounts(server: dict, account_ids: list[str]) -> t
     if not has_top_level_ids and len(exported_accounts) > len(ids):
         raise Sub2APISessionError("UPSTREAM_ERROR", "Sub2API export returned more accounts than requested")
 
-    tokens: list[str] = []
+    imported: list[dict] = []
     errors: list[dict] = []
     selected_ids = set(ids)
     matched_accounts = 0
@@ -397,17 +399,28 @@ def _fetch_access_tokens_for_accounts(server: dict, account_ids: list[str]) -> t
         if has_top_level_ids and account_id not in selected_ids:
             continue
         matched_accounts += 1
-        token = _extract_access_token(credentials)
+        from services.account_service import AccountService
         account_label = account_id or _clean(account.get("name")) or ids[index]
-        if token:
-            tokens.append(token)
+        try:
+            payload = AccountService._prepare_account_payload(account)
+        except ValueError:
+            errors.append({"name": account_label, "error": "账号凭据格式无效"})
+            continue
+        if payload:
+            imported.append(payload)
         else:
             errors.append({"name": account_label, "error": "missing access_token"})
 
     if matched_accounts < len(ids):
         errors.append({"name": ",".join(ids), "error": f"exported {matched_accounts}/{len(ids)} accounts"})
 
-    return tokens, errors
+    return imported, errors
+
+
+def _fetch_access_tokens_for_accounts(server: dict, account_ids: list[str]) -> tuple[list[str], list[dict]]:
+    """兼容旧调用方；正式导入使用完整账号对象。"""
+    accounts, errors = _fetch_accounts_for_import(server, account_ids)
+    return [item["access_token"] for item in accounts], errors
 
 
 class Sub2APIImportService:
@@ -424,7 +437,7 @@ class Sub2APIImportService:
             if not _clean(step_up_code):
                 raise Sub2APISessionError("STEP_UP_REQUIRED", "Step-up TOTP code is required", status_code=409)
             sub2api_session_manager.verify_step_up(server, step_up_code)
-        tokens, errors = _fetch_access_tokens_for_accounts(server, ids)
+        accounts, errors = _fetch_accounts_for_import(server, ids)
 
         job = {
             "job_id": uuid.uuid4().hex,
@@ -445,7 +458,7 @@ class Sub2APIImportService:
 
         thread = threading.Thread(
             target=self._run_import,
-            args=(server_id, ids, tokens, errors),
+            args=(server_id, ids, accounts, errors),
             name=f"sub2api-import-{server_id}",
             daemon=True,
         )
@@ -471,7 +484,7 @@ class Sub2APIImportService:
         self,
         server_id: str,
         account_ids: list[str],
-        tokens: list[str],
+        accounts: list[dict],
         errors: list[dict],
     ) -> None:
         self._update_job(server_id, status="running")
@@ -483,7 +496,7 @@ class Sub2APIImportService:
             failed=len(current.get("errors") or []),
         )
 
-        if not tokens:
+        if not accounts:
             current = self._config.get_import_job(server_id) or {}
             self._update_job(
                 server_id,
@@ -493,7 +506,8 @@ class Sub2APIImportService:
             )
             return
 
-        add_result = account_service.add_accounts(tokens, source_type="codex")
+        add_result = account_service.add_account_items(accounts)
+        tokens = [item["access_token"] for item in accounts]
         refresh_result = account_service.refresh_accounts(tokens)
         current = self._config.get_import_job(server_id) or {}
         self._update_job(

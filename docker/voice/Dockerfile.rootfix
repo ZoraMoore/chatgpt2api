@@ -1,0 +1,4 @@
+# 保留已验证的最终图片交付与性能优化，只替换本次误超时修复涉及的模块。
+FROM local/chatgpt2api-image:speed-test-20261016-f5ww25ex
+COPY services/voice_turn_state.py services/voice_reconciliation.py services/voice_image_transport.py services/openai_backend_api.py /app/services/
+COPY services/protocol/conversation.py /app/services/protocol/conversation.py

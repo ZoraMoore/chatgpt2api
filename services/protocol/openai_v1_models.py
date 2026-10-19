@@ -6,7 +6,7 @@ from services.account_service import account_service
 from services.firefly import SOURCE_TYPE as FIREFLY_SOURCE_TYPE
 from services.firefly import models as firefly_models
 from services.openai_backend_api import OpenAIBackendAPI
-from utils.helper import CODEX_IMAGE_MODEL
+from utils.helper import CODEX_IMAGE_MODEL, WEB_IMAGE_MODELS
 
 
 def list_models() -> dict[str, Any]:
@@ -40,7 +40,7 @@ def list_models() -> dict[str, Any]:
     }
 
     if web_image_accounts:
-        dynamic_models.add("gpt-image-2")
+        dynamic_models.update(WEB_IMAGE_MODELS)
     # 号池里有 Adobe 账号时暴露 Firefly 反代模型（firefly- 前缀）。
     if any(
         isinstance(account, dict)

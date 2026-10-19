@@ -366,8 +366,8 @@ class ConfigStore:
     def _load(self) -> dict[str, object]:
         return _read_json_object(self.path, name="config.json")
 
-    def _save(self) -> None:
-        self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    def _save(self, data: dict[str, object] | None = None) -> None:
+        self.path.write_text(json.dumps(self.data if data is None else data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     @property
     def auth_key(self) -> str:
@@ -404,6 +404,27 @@ class ConfigStore:
             return max(1, int(self.data.get("image_generation_timeout_secs", 120)))
         except (TypeError, ValueError):
             return 120
+
+    @property
+    def image_transport(self) -> str:
+        """后台选择优先；未保存过的部署继续沿用现有环境默认。"""
+        value = self.data.get("image_transport")
+        if isinstance(value, str) and value in ("voice", "conversation"):
+            return value
+        return "voice" if os.getenv("CHATGPT2API_IMAGE_TRANSPORT", "").strip().lower() == "voice" else "conversation"
+
+    @property
+    def image_edit_generation_timeout_secs(self) -> int:
+        """参考图可能继续执行代码修图，使用独立的有限生成预算。"""
+        try:
+            return min(1800, max(1, int(self.data.get("image_edit_generation_timeout_secs", 600))))
+        except (TypeError, ValueError):
+            return 600
+
+    @property
+    def image_require_reference_postprocess(self) -> bool:
+        """兼容旧配置；默认允许网站交付有效的首轮图片并标记质量状态。"""
+        return _normalize_bool(self.data.get("image_require_reference_postprocess"), False)
 
     @property
     def image_poll_timeout_secs(self) -> int:
@@ -566,6 +587,7 @@ class ConfigStore:
         data["image_retention_days"] = self.image_retention_days
         data["image_management_enabled"] = self.image_management_enabled
         data["image_generation_timeout_secs"] = self.image_generation_timeout_secs
+        data["image_transport"] = self.image_transport
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
@@ -611,6 +633,10 @@ class ConfigStore:
     def update(self, data: dict[str, object]) -> dict[str, object]:
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
+        if "image_transport" in next_data:
+            transport = next_data["image_transport"]
+            if not isinstance(transport, str) or transport not in ("voice", "conversation"):
+                raise ValueError("image_transport must be voice or conversation")
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:
@@ -632,8 +658,9 @@ class ConfigStore:
                     incoming_runtime["_existing_cf_clearance"] = previous_clearance.get("cf_clearance")
             next_data["proxy_runtime"] = _normalize_proxy_runtime_settings(incoming_runtime)
         next_data.pop("backup_state", None)
+        # 保存失败时保持当前路由，避免后台显示失败却已经切换所有新请求。
+        self._save(next_data)
         self.data = next_data
-        self._save()
         return self.get()
 
     def get_backup_settings(self) -> dict[str, object]:

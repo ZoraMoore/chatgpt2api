@@ -266,7 +266,11 @@ def create_router() -> APIRouter:
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        account_payloads = [item for item in body.accounts if isinstance(item, dict)]
+        try:
+            account_payloads = [payload for item in body.accounts
+                                if (payload := account_service._prepare_account_payload(item)) is not None]
+        except ValueError as exc:
+            raise HTTPException(400, detail={"error": str(exc)}) from None
         payload_tokens = [_account_payload_token(item) for item in account_payloads]
         tokens = _unique_tokens([*body.tokens, *payload_tokens])
         if not tokens:

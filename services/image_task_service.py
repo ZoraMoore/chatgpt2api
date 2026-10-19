@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -9,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from services.config import DATA_DIR, config
+from services.account_service import account_service
+from services.image_execution import image_work_pool
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
@@ -72,6 +76,8 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
     }
+    if task.get("image_transport") in ("voice", "conversation"):
+        item["image_transport"] = task["image_transport"]
     if task.get("conversation_id"):
         item["conversation_id"] = task.get("conversation_id")
     if task.get("data") is not None:
@@ -129,6 +135,7 @@ class ImageTaskService:
         size: str | None,
         quality: str = "auto",
         base_url: str = "",
+        image_transport: str | None = None,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
@@ -138,6 +145,7 @@ class ImageTaskService:
             "quality": quality,
             "response_format": "url",
             "base_url": base_url,
+            "_image_transport": config.image_transport if image_transport is None else image_transport,
         }
         return self._submit(identity, client_task_id=client_task_id, mode="generate", payload=payload)
 
@@ -153,6 +161,7 @@ class ImageTaskService:
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
+        image_transport: str | None = None,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
@@ -164,6 +173,7 @@ class ImageTaskService:
             "quality": quality,
             "response_format": "url",
             "base_url": base_url,
+            "_image_transport": config.image_transport if image_transport is None else image_transport,
         }
         return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
 
@@ -202,6 +212,11 @@ class ImageTaskService:
         task_id = _clean(client_task_id)
         if not task_id:
             raise ValueError("client_task_id is required")
+        transport = payload.get("_image_transport", config.image_transport)
+        if not isinstance(transport, str) or transport not in ("voice", "conversation"):
+            raise ValueError("image_transport must be voice or conversation")
+        # 入队时固定全局选择，之后的设置更新不能改变排队或同一批图片。
+        payload = {**payload, "_image_transport": transport}
         owner = _owner_id(identity)
         key = _task_key(owner, task_id)
         now = _now_iso()
@@ -221,22 +236,22 @@ class ImageTaskService:
                 "model": _clean(payload.get("model"), "gpt-image-2"),
                 "size": _clean(payload.get("size")),
                 "quality": _clean(payload.get("quality"), "auto"),
+                "image_transport": transport,
                 "created_at": now,
                 "updated_at": now,
                 "created_ts": time.time(),
+                "prompt": _clean(payload.get("prompt")),
+                "response_format": _clean(payload.get("response_format"), "url"),
+                "base_url": _clean(payload.get("base_url")),
             }
             self._tasks[key] = task
             self._save_locked()
             should_start = True
 
         if should_start:
-            thread = threading.Thread(
-                target=self._run_task,
-                args=(key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2")),
-                name=f"image-task-{task_id[:16]}",
-                daemon=True,
+            image_work_pool.submit(
+                self._run_task, key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2"),
             )
-            thread.start()
         return _public_task(task)
 
     def _run_task(
@@ -292,15 +307,20 @@ class ImageTaskService:
                 request_preview=request_text(payload.get("prompt")),
                 urls=_collect_image_urls(data),
                 account_email=account_email,
+                conversation_id=_clean(result.get("_conversation_id")),
+                image_execution=result.get("_image_execution"),
+                image_transport=payload.get("_image_transport", ""),
             )
         except Exception as exc:
             error_message = str(exc) or "image task failed"
             account_email = _clean(getattr(exc, "account_email", ""))
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
+            account_ref = _clean(getattr(exc, "resume_account_ref", ""))
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
                               duration_ms=duration_ms,
-                              **({"conversation_id": conversation_id} if conversation_id else {}))
+                              **({"conversation_id": conversation_id} if conversation_id else {}),
+                              **({"resume_account_ref": account_ref} if re.fullmatch(r"[0-9a-f]{64}", account_ref) else {}))
             self._log_call(
                 identity,
                 mode,
@@ -311,6 +331,9 @@ class ImageTaskService:
                 status="failed",
                 error=error_message,
                 account_email=account_email,
+                conversation_id=conversation_id,
+                image_execution=getattr(exc, "image_execution", None),
+                image_transport=payload.get("_image_transport", ""),
             )
 
     def _log_call(
@@ -326,6 +349,9 @@ class ImageTaskService:
         error: str = "",
         urls: list[str] | None = None,
         account_email: str = "",
+        conversation_id: str = "",
+        image_execution: list[dict[str, Any]] | None = None,
+        image_transport: str = "",
     ) -> None:
         endpoint = "/v1/images/edits" if mode == "edit" else "/v1/images/generations"
         summary_prefix = "图生图" if mode == "edit" else "文生图"
@@ -346,6 +372,12 @@ class ImageTaskService:
             detail["error"] = error
         if account_email:
             detail["account_email"] = account_email
+        if conversation_id:
+            detail["conversation_id"] = conversation_id
+        if image_execution:
+            detail["image_execution"] = image_execution
+        if image_transport in ("voice", "conversation"):
+            detail["image_transport"] = image_transport
         if urls:
             detail["urls"] = list(dict.fromkeys(urls))
         try:
@@ -399,6 +431,11 @@ class ImageTaskService:
                 "started_ts": item.get("started_ts"),
                 "duration_ms": item.get("duration_ms"),
             }
+            for name in ("conversation_id", "resume_account_ref", "prompt", "response_format", "base_url"):
+                if isinstance(item.get(name), str):
+                    task[name] = item[name]
+            if item.get("image_transport") in ("voice", "conversation"):
+                task["image_transport"] = item["image_transport"]
             data = item.get("data")
             if isinstance(data, list):
                 task["data"] = data
@@ -448,35 +485,31 @@ class ImageTaskService:
         task_id: str,
         extra_timeout_secs: float = 30.0,
     ) -> dict[str, Any]:
-        """恢复对已超时任务的轮询，额外等待 extra_timeout_secs 秒。"""
-        owner = _owner_id(identity)
-        key = _task_key(owner, _clean(task_id))
+        """只读取原账号的既有会话；账号引用不暴露到公开任务响应中。"""
+        if (not isinstance(extra_timeout_secs, (int, float)) or isinstance(extra_timeout_secs, bool)
+                or not math.isfinite(extra_timeout_secs) or not 5 <= extra_timeout_secs <= 120):
+            raise ValueError("extra_timeout_secs must be between 5 and 120")
+        key = _task_key(_owner_id(identity), _clean(task_id))
         with self._lock:
             task = self._tasks.get(key)
             if task is None:
                 raise ValueError("task not found")
             if task.get("status") != TASK_STATUS_ERROR:
                 raise ValueError("task is not in error state")
-            error_msg = _clean(task.get("error"))
-            if "超时" not in error_msg:
-                raise ValueError("task error is not a timeout error")
             conversation_id = _clean(task.get("conversation_id"))
-            if not conversation_id:
-                raise ValueError("task has no conversation_id")
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conversation_id):
+                raise ValueError("task has no valid conversation_id")
+            account_ref = _clean(task.get("resume_account_ref"))
+            if not re.fullmatch(r"[0-9a-f]{64}", account_ref):
+                raise ValueError("task has no original account reference; cannot resume safely")
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
-            # 将任务状态重置为 running
-            self._update_task(key, status=TASK_STATUS_RUNNING, error="")
-
-        # 启动新线程继续轮询
-        thread = threading.Thread(
-            target=self._run_resume_poll,
-            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
-            name=f"image-resume-{_clean(task_id)[:16]}",
-            daemon=True,
+            self._update_task(key, status=TASK_STATUS_QUEUED, error="")
+            public = _public_task(task)
+        image_work_pool.submit(
+            self._run_resume_poll, key, conversation_id, extra_timeout_secs, dict(identity), mode, model,
         )
-        thread.start()
-        return _public_task(task)
+        return public
 
     def _run_resume_poll(
         self,
@@ -487,71 +520,55 @@ class ImageTaskService:
         mode: str,
         model: str,
     ) -> None:
-        """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
         backend = None
+        token = ""
+        self._update_task(key, status=TASK_STATUS_RUNNING)
         try:
             from services.openai_backend_api import OpenAIBackendAPI
-            from services.protocol.conversation import format_image_result
+            from services.protocol.conversation import ConversationRequest, collect_image_outputs, stream_image_outputs
 
-            backend = OpenAIBackendAPI(proxy_url=config.proxy_url or None)
-            file_ids, sediment_ids = backend._poll_image_results(
-                conversation_id,
-                extra_timeout_secs,
-            )
-            if not file_ids and not sediment_ids:
-                raise RuntimeError(
-                    f"继续等待 {extra_timeout_secs} 秒后仍未找到图片结果。"
-                )
-
-            image_urls = backend.resolve_conversation_image_urls(
-                conversation_id, file_ids, sediment_ids, poll=False,
-            )
-            if not image_urls:
-                raise RuntimeError("图片 URL 解析失败")
-
-            image_items = [
-                {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
-                for image_data in backend.download_image_bytes(image_urls)
-            ]
-            # 获取 task 的原始 prompt（从 _public_task 的 mode 判断）
             with self._lock:
-                task = self._tasks.get(key)
-                quality = _clean(task.get("quality"), "auto") if task else "auto"
-                size = _clean(task.get("size")) if task else None
-            data = format_image_result(
-                image_items,
-                "",  # prompt 已不重要，结果已经拿到了
-                "b64_json",
-                "",
-                int(time.time()),
-            )["data"]
-            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
-            self._log_call(
-                identity,
-                mode,
-                model,
-                started,
-                "调用完成（续轮询）",
-                status="success",
-                urls=_collect_image_urls(data),
+                task = dict(self._tasks[key])
+            token = account_service.acquire_image_resume_token(task.get("resume_account_ref", ""), conversation_id=conversation_id)
+            active_token = account_service.refresh_access_token(token, event="image_resume") or token
+            backend = OpenAIBackendAPI(access_token=active_token)
+            request = ConversationRequest(
+                model=model, prompt=task.get("prompt", ""),
+                response_format=task.get("response_format", "url"), base_url=task.get("base_url") or None,
+                image_transport=task.get("image_transport") or config.image_transport,
             )
+            backend.image_transport = request.image_transport
+            result = collect_image_outputs(stream_image_outputs(
+                backend, request, resume_conversation_id=conversation_id, poll_timeout_secs=extra_timeout_secs,
+                resume_has_reference=mode == "edit",
+                # 历史任务缺少模式记录时沿用旧交付规则，不能猜测它属于普通会话。
+                allow_terminal_recovery=task.get("image_transport") == "conversation",
+            ))
+            data = result.get("data")
+            if not isinstance(data, list) or not data:
+                raise RuntimeError("原会话尚未交付图片，可稍后继续等待。")
+            account_service.complete_image_probe_from_resume(active_token, conversation_id)
+            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="",
+                              duration_ms=int((time.time() - started) * 1000))
+            self._log_call(identity, mode, model, started, "调用完成（续轮询）", status="success",
+                           urls=_collect_image_urls(data), conversation_id=conversation_id,
+                           image_execution=result.get("_image_execution"))
         except Exception as exc:
             error_message = str(exc) or "resume poll failed"
-            duration_ms = int((time.time() - started) * 1000)
-            self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[], duration_ms=duration_ms)
-            self._log_call(
-                identity,
-                mode,
-                model,
-                started,
-                "调用失败（续轮询）",
-                status="failed",
-                error=error_message,
-            )
+            self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
+                              duration_ms=int((time.time() - started) * 1000))
+            self._log_call(identity, mode, model, started, "调用失败（续轮询）", status="failed",
+                           error=error_message, conversation_id=conversation_id,
+                           image_execution=getattr(exc, "image_execution", None))
         finally:
-            if backend is not None:
-                backend.close()
+            try:
+                if backend is not None:
+                    backend.close()
+            finally:
+                if token:
+                    # 读取既有结果不消耗第二份生成额度，也不再次结算原尝试。
+                    account_service.release_image_slot(token)
 
 
 image_task_service = ImageTaskService(DATA_DIR / "image_tasks.json")

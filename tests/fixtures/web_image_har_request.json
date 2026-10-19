@@ -1,0 +1,82 @@
+{
+  "prepare": {
+    "client_prepare_state": "sent",
+    "action": "next",
+    "is_do_not_remember": false,
+    "model": "gpt-6-thinking",
+    "parent_message_id": "client-created-root",
+    "thinking_effort": "extended",
+    "timezone": "Asia/Shanghai",
+    "timezone_offset_min": -480,
+    "local_function_names": [
+      "local.continue_in_work"
+    ],
+    "partial_query": {
+      "author": {
+        "role": "user"
+      },
+      "content": {
+        "content_type": "text",
+        "parts": [
+          "测试小猫"
+        ]
+      },
+      "id": "fixture-prepare-id"
+    },
+    "client_prepare_dispatch": "debounced",
+    "client_prepare_source": "context_change"
+  },
+  "conversation": {
+    "turn_attribution": {
+      "turn_trigger": "composer"
+    },
+    "action": "next",
+    "is_do_not_remember": false,
+    "model": "gpt-6-thinking",
+    "parent_message_id": "client-created-root",
+    "thinking_effort": "extended",
+    "timezone": "Asia/Shanghai",
+    "timezone_offset_min": -480,
+    "client_contextual_info": {
+      "app_name": "chatgpt.com",
+      "app_surface": "codex_browser",
+      "has_web_push_capabilities": true,
+      "web_push_notification_permission": "default"
+    },
+    "local_function_names": [
+      "local.continue_in_work"
+    ],
+    "messages": [
+      {
+        "author": {
+          "metadata": {},
+          "name": null,
+          "role": "user"
+        },
+        "channel": null,
+        "content": {
+          "content_type": "text",
+          "parts": [
+            "测试小猫"
+          ]
+        },
+        "create_time": 0,
+        "end_turn": null,
+        "id": "fixture-message-id",
+        "metadata": {},
+        "recipient": "all",
+        "status": "finished_successfully",
+        "update_time": null,
+        "weight": 1
+      }
+    ],
+    "supported_encodings": [
+      "v1"
+    ],
+    "browser_context": {
+      "instance_id": "fixture-browser-id"
+    },
+    "genui_state_snapshots": [],
+    "client_prepare_state": "success"
+  }
+}

@@ -1,0 +1,4 @@
+# 本轮只覆盖语音生命周期和日志关联，保留现网其余已验证代码及静态文件。
+FROM local/chatgpt2api-image:voice-20261015-7aw0klsx
+COPY services/voice_image_transport.py /app/services/voice_image_transport.py
+COPY services/protocol/conversation.py /app/services/protocol/conversation.py

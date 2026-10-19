@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Iterator
 
+from services.config import config
 from services.protocol.conversation import (
     ConversationRequest,
     collect_image_outputs,
@@ -31,6 +32,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         base_url=base_url,
         message_as_error=True,
         progress_callback=progress_callback,
+        image_transport=body.get("_image_transport") or config.image_transport,
     ))
     if body.get("stream"):
         return stream_image_chunks(outputs)

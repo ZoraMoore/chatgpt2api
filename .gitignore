@@ -19,3 +19,6 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# 浏览器校验运行时（不含项目源码）
+/.runtime/sentinel/

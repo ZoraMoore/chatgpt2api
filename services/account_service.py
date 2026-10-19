@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import re
 import secrets
 import time
 import uuid
@@ -12,7 +14,9 @@ from threading import Condition, Lock, Thread
 from typing import Any
 from urllib.parse import urlencode
 
+from services.browser_sentinel import browser_sentinel_enabled, has_web_session, normalize_web_session_token
 from services.config import config
+from services.image_quota import active_image_limit, CHECK_RETRY, ImageQuotaExceeded
 from services.log_service import (
     LOG_TYPE_ACCOUNT,
     log_service,
@@ -55,6 +59,7 @@ class AccountService:
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
         self._token_aliases: dict[str, str] = {}
+        self._image_probe_leases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
 
     def _get_cumulative_file(self) -> Path:
@@ -115,15 +120,24 @@ class AccountService:
         except (TypeError, ValueError):
             return ""
         tz = timezone(timedelta(hours=8))
-        return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz).isoformat()
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return ""
 
     def _load_accounts(self) -> dict[str, dict]:
         accounts = self.storage.load_accounts()
-        return {
+        loaded = {
             normalized["access_token"]: normalized
             for item in accounts
             if (normalized := self._normalize_account(item)) is not None
         }
+        for account in loaded.values():
+            limit = active_image_limit(account)
+            if limit and limit.get("state") in ("probing", "probe_ready"):
+                # 进程内验证槽不会跨重启存活；重新查询后才允许下一次业务验证。
+                account["image_limit"] = {**limit, "state": "awaiting_check", "next_check_at": 0}
+        return loaded
 
     def _save_accounts(self) -> None:
         self.storage.save_accounts(list(self._accounts.values()))
@@ -132,7 +146,12 @@ class AccountService:
     def _is_image_account_available(account: dict) -> bool:
         if not isinstance(account, dict):
             return False
-        if account.get("status") in {"禁用", "限流", "异常"}:
+        if account.get("status") in {"禁用", "异常"}:
+            return False
+        limit = active_image_limit(account)
+        if limit:
+            return limit.get("state") == "probe_ready"
+        if account.get("status") == "限流":
             return False
         return int(account.get("quota") or 0) > 0
 
@@ -240,6 +259,16 @@ class AccountService:
         normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
         normalized["created_at"] = normalized.get("created_at") or AccountService._now()
+        limit = active_image_limit(normalized)
+        if limit:
+            normalized["quota"] = 0
+            if normalized["status"] != "禁用":
+                normalized["status"] = "限流"
+            normalized["restore_at"] = self._timestamp_to_iso(limit.get("restore_at"))
+        management_id = normalized.get("management_id")
+        if not isinstance(management_id, str) or not re.fullmatch(r"[a-f0-9]{64}", management_id):
+            # 与 token 轮换一起持久化，避免无 JWT 身份的账号换 token 后丢失操作选择。
+            normalized["management_id"] = hashlib.sha256(("management:" + access_token).encode()).hexdigest()
         return normalized
 
     @staticmethod
@@ -257,10 +286,31 @@ class AccountService:
         return exp - int(time.time())
 
     @classmethod
-    def _token_needs_refresh(cls, access_token: str, *, force: bool = False) -> bool:
+    def account_token_expiry(cls, account: dict) -> int | None:
+        """优先相信实际 Token 的 exp；不透明凭据使用导入的明确到期时间。"""
+        exp = cls._jwt_exp(str(account.get("access_token") or ""))
+        if 0 < exp < 253402300800:
+            return exp
+        raw = account.get("expires_at") or account.get("expired") or account.get("expiry")
+        try:
+            value = float(raw)
+            if value > 1e12:
+                value /= 1000
+            if 0 < value < 253402300800:
+                return int(value)
+        except (ValueError, TypeError, OverflowError):
+            pass
+        parsed = cls._parse_time(raw)
+        return int(parsed.timestamp()) if parsed is not None else None
+
+    @classmethod
+    def _token_needs_refresh(cls, access_token: str, *, force: bool = False, account: dict | None = None) -> bool:
         if force:
             return True
-        remaining = cls._token_expires_in(access_token)
+        if account is not None and (account.get("auto_refresh_token") is False or account.get("status") == "禁用"):
+            return False
+        exp = cls.account_token_expiry(account or {"access_token": access_token})
+        remaining = exp - int(time.time()) if exp is not None else None
         return remaining is not None and remaining <= cls._ACCESS_TOKEN_REFRESH_SKEW_SECONDS
 
     @classmethod
@@ -340,6 +390,8 @@ class AccountService:
         )
 
     def _refresh_token_keepalive_due_at(self, account: dict, now: datetime) -> datetime | None:
+        if account.get("auto_refresh_token") is False:
+            return None
         if not str(account.get("refresh_token") or "").strip():
             return None
         if account.get("status") == "禁用":
@@ -368,24 +420,37 @@ class AccountService:
                 data={
                     "grant_type": "refresh_token",
                     "refresh_token": refresh_token,
-                    "client_id": self._OAUTH_CLIENT_ID,
+                    "client_id": self._oauth_client_id(account or {}),
                 },
                 timeout=60,
             )
             data = response.json() if response.text else {}
             if response.status_code != 200 or not isinstance(data, dict) or not data.get("access_token"):
-                detail = ""
-                if isinstance(data, dict):
-                    detail = str(data.get("error_description") or data.get("error") or data.get("message") or "")
-                detail = detail or self._safe_response_text(response)
-                raise RuntimeError(f"oauth_refresh_http_{response.status_code}{': ' + detail if detail else ''}")
-            return {
+                error = data.get("error") if isinstance(data, dict) else None
+                code = error.get("code") if isinstance(error, dict) else error
+                code = code if isinstance(code, str) and re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", code) else "refresh_rejected"
+                if "app_session_terminated" in str(data):
+                    code = "app_session_terminated"
+                raise RuntimeError(f"oauth_refresh_http_{response.status_code}: {code}")
+            result = {
                 "access_token": str(data.get("access_token") or "").strip(),
                 "refresh_token": str(data.get("refresh_token") or refresh_token).strip(),
                 "id_token": str(data.get("id_token") or "").strip(),
             }
+            self._prepare_account_payload(result)
+            expires_in = data.get("expires_in")
+            if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool) and 0 < expires_in <= 366 * 86400:
+                result["expires_in"] = expires_in
+            return result
         finally:
             session.close()
+
+    @classmethod
+    def _oauth_client_id(cls, account: dict) -> str:
+        value = account.get("client_id") or cls._OAUTH_CLIENT_ID
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value):
+            raise ValueError("invalid OAuth client_id")
+        return value
 
     def _apply_refreshed_tokens(self, old_access_token: str, token_data: dict, event: str) -> str:
         now = datetime.now(timezone.utc).isoformat()
@@ -404,6 +469,12 @@ class AccountService:
                 next_item["refresh_token"] = str(token_data.get("refresh_token") or "").strip()
             if token_data.get("id_token"):
                 next_item["id_token"] = str(token_data.get("id_token") or "").strip()
+            expires_at = self._jwt_exp(new_token)
+            expires_in = token_data.get("expires_in")
+            if expires_at > 0:
+                next_item["expires_at"] = expires_at
+            elif isinstance(expires_in, (int, float)) and 0 < expires_in <= 366 * 86400:
+                next_item["expires_at"] = int(time.time() + expires_in)
             next_item["last_token_refresh_at"] = now
             next_item["last_token_refresh_error"] = None
             next_item["last_token_refresh_error_at"] = None
@@ -423,6 +494,9 @@ class AccountService:
                 old_inflight = int(self._image_inflight.pop(old_token, 0))
                 if old_inflight:
                     self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
+                lease = self._image_probe_leases.pop(old_token, None)
+                if lease:
+                    self._image_probe_leases[new_token] = lease
             self._accounts[new_token] = account
             self._save_accounts()
             self._image_slot_condition.notify_all()
@@ -504,7 +578,7 @@ class AccountService:
             if self._is_firefly_account(account):
                 return self._refresh_firefly_access_token(resolved_token, account, force=force, event=event)
             active_token = str(account.get("access_token") or resolved_token or access_token)
-            if not self._token_needs_refresh(active_token, force=force):
+            if not self._token_needs_refresh(active_token, force=force, account=account):
                 return active_token
             refresh_token = str(account.get("refresh_token") or "").strip()
             if not refresh_token:
@@ -557,7 +631,7 @@ class AccountService:
                 self.update_account(new_token, {
                     "source_type": result.get("source_type", "password"),
                     "status": "正常",
-                }, quiet=True)
+                }, quiet=True, remote=True)
 
                 log_service.add(
                     LOG_TYPE_ACCOUNT,
@@ -902,7 +976,7 @@ class AccountService:
                 for account in self._accounts.values()
                 if str(account.get("refresh_token") or "").strip()
                 and (token := str(account.get("access_token") or "").strip())
-                and self._token_needs_refresh(token)
+                and self._token_needs_refresh(token, account=account)
             ]
 
     def list_refresh_token_keepalive_tokens(self) -> list[str]:
@@ -956,7 +1030,7 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> list[str]:
         excluded = set(excluded_tokens or set())
-        return [
+        tokens = [
             token
             for item in self._accounts.values()
             if self._is_image_account_available(item)
@@ -966,6 +1040,13 @@ class AccountService:
                and (token := item.get("access_token") or "")
                and token not in excluded
         ]
+        # 原生网页路径优先选择带完整会话的账号；保留显式套餐筛选和原有并发槽。
+        # 未配置浏览器进程或使用 Codex 来源时，沿用原选择逻辑。
+        if browser_sentinel_enabled() and source_type != "codex":
+            complete = [token for token in tokens if has_web_session(self._accounts[token])]
+            if complete:
+                return complete
+        return tokens
 
     def _list_available_candidate_tokens(
             self,
@@ -978,7 +1059,7 @@ class AccountService:
         return [
             token
             for token in self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
-            if int(self._image_inflight.get(token, 0)) < max_concurrency
+            if int(self._image_inflight.get(token, 0)) < (1 if active_image_limit(self._accounts[token]) else max_concurrency)
         ]
 
     def _acquire_next_candidate_token(
@@ -999,6 +1080,17 @@ class AccountService:
                 if tokens:
                     access_token = tokens[self._index % len(tokens)]
                     self._index += 1
+                    current = self._accounts[access_token]
+                    limit = active_image_limit(current)
+                    if limit:
+                        self._accounts[access_token] = self._normalize_account({**current,
+                            "image_limit": {**limit, "state": "probing", "probe_conversation_id": ""}})
+                        try:
+                            self._save_accounts()
+                        except Exception:
+                            self._accounts[access_token] = current
+                            raise
+                        self._image_probe_leases[access_token] = str(limit.get("event_id") or "")
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     return access_token
                 self._image_slot_condition.wait(timeout=1.0)
@@ -1013,7 +1105,57 @@ class AccountService:
                 self._image_inflight.pop(access_token, None)
             else:
                 self._image_inflight[access_token] = current_inflight - 1
+            if current_inflight <= 1:
+                lease = self._image_probe_leases.pop(access_token, None)
+                current = self._accounts.get(access_token)
+                limit = active_image_limit(current)
+                if lease and limit and limit.get("state") == "probing" and lease == limit.get("event_id"):
+                    self._accounts[access_token] = self._normalize_account({**current, "image_limit": {
+                        **limit, "state": "awaiting_check", "next_check_at": time.time() + CHECK_RETRY}})
+                    self._save_accounts()
             self._image_slot_condition.notify_all()
+
+    @classmethod
+    def _image_account_ref_from_record(cls, account: dict) -> str:
+        token = str(account.get("access_token") or "")
+        claims = cls._decode_jwt_payload(token)
+        auth = claims.get("https://api.openai.com/auth")
+        auth = auth if isinstance(auth, dict) else {}
+        identity = [
+            str(account.get("user_id") or auth.get("chatgpt_user_id") or account.get("email") or ""),
+            str(auth.get("chatgpt_account_id") or account.get("account_id") or ""),
+            str(account.get("source_type") or "web"),
+        ]
+        # 持久化不可逆账号引用，不把凭据复制到任务文件；稳定身份可跨 token rotation。
+        source = json.dumps(identity, separators=(",", ":")) if identity[0] else token
+        return hashlib.sha256(source.encode()).hexdigest() if source else ""
+
+    def image_account_ref(self, access_token: str) -> str:
+        account = self.get_account(access_token)
+        return self._image_account_ref_from_record(account) if account else ""
+
+    def acquire_image_resume_token(self, account_ref: str, wait_timeout_secs: float = 30.0, *, conversation_id: str = "") -> str:
+        if not isinstance(account_ref, str) or not re.fullmatch(r"[0-9a-f]{64}", account_ref):
+            raise ValueError("original image account reference is missing or invalid")
+        deadline = time.monotonic() + wait_timeout_secs
+        with self._image_slot_condition:
+            while True:
+                matches = [token for token, account in self._accounts.items()
+                           if self._image_account_ref_from_record(account) == account_ref
+                           and account.get("status") != "禁用"]
+                if not matches:
+                    raise ValueError("original image account is no longer available")
+                for token in matches:
+                    limit = active_image_limit(self._accounts[token])
+                    if limit and conversation_id and limit.get("conversation_id") == conversation_id:
+                        raise ImageQuotaExceeded(limit)
+                    if self._image_inflight.get(token, 0) < max(1, config.image_account_concurrency):
+                        self._image_inflight[token] = self._image_inflight.get(token, 0) + 1
+                        return token
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("original image account is busy; try resuming later")
+                self._image_slot_condition.wait(timeout=min(1.0, remaining))
 
     def get_available_access_token(
             self,
@@ -1047,7 +1189,7 @@ class AccountService:
             if resolved and resolved != access_token:
                 attempted_tokens.add(resolved)
             if (
-                    self._is_image_account_available(account or {})
+                    (self._is_image_account_available(account or {}) or self._owns_image_probe(str((account or {}).get("access_token") or access_token)))
                     and self._account_matches_plan_type(account or {}, plan_type)
                     and self._account_matches_any_plan_type(account or {}, plan_types)
                     and self._account_matches_source_type(account or {}, source_type)
@@ -1092,6 +1234,9 @@ class AccountService:
             self._save_accounts()
 
     def remove_invalid_token(self, access_token: str, event: str, quiet: bool = False) -> bool:
+        if active_image_limit(self.get_account(access_token)):
+            # 冷却/到期复查失败属于可恢复限额流程，不能走失效账号自动删除。
+            return False
         if not config.auto_remove_invalid_accounts:
             self.update_account(access_token, {"status": "异常", "quota": 0}, quiet=quiet)
             return False
@@ -1123,6 +1268,20 @@ class AccountService:
                 account = dict(item)
                 token = account.get("access_token") or ""
                 account["image_inflight"] = int(self._image_inflight.get(token, 0))
+                account["account_ref"] = account["management_id"]
+                account["access_token_expires_at"] = self._timestamp_to_iso(self.account_token_expiry(account))
+                account["has_refresh_token"] = bool(str(account.get("refresh_token") or "").strip())
+                account["auto_refresh_token"] = account.get("auto_refresh_token") is not False
+                account["image_cleanup_enabled"] = account.get("image_cleanup_enabled") is True
+                limit = active_image_limit(account)
+                phase = str(limit.get("state") or "") if limit else ""
+                if phase == "cooldown" and time.time() >= float(limit.get("restore_at") or 0):
+                    phase = "awaiting_check"
+                account["image_limit_state"] = phase
+                account["image_limit_reason"] = str(limit.get("reason") or "") if limit else ""
+                account["image_limit_restore_at"] = self._timestamp_to_iso(limit.get("restore_at")) if limit else ""
+                account["image_limit_occurred_at"] = self._timestamp_to_iso(limit.get("occurred_at")) if limit else ""
+                account["image_limit_next_check_at"] = self._timestamp_to_iso(limit.get("next_check_at")) if limit else ""
                 result.append(account)
             return result
 
@@ -1152,12 +1311,41 @@ class AccountService:
     def _prepare_account_payload(item: dict) -> dict | None:
         if not isinstance(item, dict):
             return None
+        if "credentials" in item:
+            if not isinstance(item["credentials"], dict):
+                raise ValueError("invalid Sub2API credentials")
+            if str(item.get("platform") or "openai").lower() != "openai":
+                return None
+            credentials = dict(item["credentials"])
+            if len(json.dumps(item, ensure_ascii=False)) > 1024 * 1024:
+                raise ValueError("account payload is too large")
+            metadata = {key: value for key, value in item.items() if key != "credentials"}
+            # 来源元数据保留完整，但导入凭据不能顺带授权本地自动删除或改写身份引用。
+            local_fields = {key: credentials.pop(key) for key in list(credentials)
+                            if key.startswith(("image_cleanup_", "image_limit")) or key in {"management_id", "account_ref", "auto_refresh_token"}}
+            if local_fields:
+                metadata["credential_local_fields"] = local_fields
+            if not (credentials.get("access_token") or credentials.get("accessToken")) and credentials.get("token"):
+                credentials["access_token"] = credentials["token"]
+            claims = AccountService._decode_jwt_payload(str(credentials.get("access_token") or ""))
+            item = {**credentials, "sub2api": metadata, "source_type": "codex",
+                    "email": credentials.get("email") or claims.get("email") or metadata.get("name"),
+                    "type": credentials.get("plan_type") or credentials.get("account_plan") or "free"}
+        for key in ("access_token", "accessToken", "refresh_token", "id_token"):
+            value = item.get(key)
+            if value is not None and (not isinstance(value, str) or len(value) > 65536
+                    or any(ord(char) < 33 or ord(char) > 126 for char in value)):
+                raise ValueError(f"invalid {key} format")
         access_token = AccountService._account_payload_token(item)
         if not access_token:
             return None
         payload = dict(item)
         payload.pop("accessToken", None)
         payload["access_token"] = access_token
+        if "sessionToken" in payload or "web_session_token" in payload:
+            payload["web_session_token"] = normalize_web_session_token(
+                payload.get("web_session_token") or payload.get("sessionToken"))
+            payload.pop("sessionToken", None)
         # CPA/Codex 导出文件里的 `type=codex` 是导出格式，不是号池套餐类型。
         if str(payload.get("type") or "").strip().lower() == "codex":
             payload["export_type"] = "codex"
@@ -1183,6 +1371,19 @@ class AccountService:
         if payload.get("plan_type") and not payload.get("type"):
             payload["type"] = str(payload.get("plan_type") or "").strip()
         return payload
+
+    @classmethod
+    def _import_identity(cls, account: dict) -> tuple[str, str] | None:
+        if cls._is_firefly_account(account):
+            return None
+        claims = cls._decode_jwt_payload(str(account.get("access_token") or ""))
+        auth = claims.get("https://api.openai.com/auth") or {}
+        if not isinstance(auth, dict):
+            auth = {}
+        user = str(auth.get("chatgpt_user_id") or account.get("user_id") or account.get("email") or claims.get("email") or "").lower()
+        organization = str(auth.get("chatgpt_account_id") or account.get("account_id") or "")
+        # 不能仅凭邮箱合并不同工作区；身份不完整时维持按 token 匹配。
+        return (user, organization) if user and organization else None
 
     def add_account_items(self, items: list[dict]) -> dict:
         payloads = [
@@ -1221,6 +1422,26 @@ class AccountService:
             for access_token, payload in deduped.items():
                 current = self._accounts.get(access_token)
                 if current is None:
+                    identity = self._import_identity(payload)
+                    matches = [(key, value) for key, value in self._accounts.items()
+                               if identity is not None and self._import_identity(value) == identity]
+                    if len(matches) == 1:
+                        previous_token, current = matches[0]
+                        old_issued = self._token_issued_at(previous_token)
+                        incoming_issued = self._token_issued_at(access_token)
+                        if old_issued and incoming_issued and incoming_issued < old_issued:
+                            self._token_aliases[access_token] = previous_token
+                            skipped += 1
+                            continue
+                        self._accounts.pop(previous_token)
+                        self._token_aliases[previous_token] = access_token
+                        inflight = self._image_inflight.pop(previous_token, 0)
+                        if inflight:
+                            self._image_inflight[access_token] = self._image_inflight.get(access_token, 0) + inflight
+                        lease = self._image_probe_leases.pop(previous_token, None)
+                        if lease:
+                            self._image_probe_leases[access_token] = lease
+                if current is None:
                     added += 1
                     self._cumulative_total += 1
                     self._save_cumulative_total()
@@ -1228,6 +1449,15 @@ class AccountService:
                 else:
                     skipped += 1
                 incoming = dict(payload)
+                if current.get("image_limit"):
+                    incoming.pop("image_limit", None)
+                    incoming.pop("image_limit_events", None)
+                if current.get("status") == "禁用":
+                    incoming["status"] = "禁用"
+                # 不完整重导入不能抹掉已经保存的续期凭据。
+                for key in ("refresh_token", "id_token", "web_session_token"):
+                    if not incoming.get(key):
+                        incoming.pop(key, None)
                 if not incoming.get("created_at"):
                     incoming.pop("created_at", None)
                 account = self._normalize_account(
@@ -1270,7 +1500,7 @@ class AccountService:
             items = [dict(item) for item in self._accounts.values()]
         return {"removed": removed, "items": items}
 
-    def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
+    def update_account(self, access_token: str, updates: dict, quiet: bool = False, *, remote: bool = False) -> dict | None:
         if not access_token:
             return None
         with self._lock:
@@ -1278,10 +1508,12 @@ class AccountService:
             current = self._accounts.get(access_token)
             if current is None:
                 return None
+            if remote and current.get("status") == "禁用":
+                updates = {**updates, "status": "禁用"}
             account = self._normalize_account({**current, **updates, "access_token": access_token})
             if account is None:
                 return None
-            if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
+            if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts and not account.get("image_limit"):
                 self._accounts.pop(access_token, None)
                 self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
@@ -1358,18 +1590,34 @@ class AccountService:
     def mark_image_result(self, access_token: str, success: bool) -> dict | None:
         if not access_token:
             return None
-        self.release_image_slot(access_token)
-        with self._lock:
+        with self._image_slot_condition:
             access_token = self._resolve_access_token_locked(access_token)
+            inflight = self._image_inflight.get(access_token, 0)
+            if inflight <= 1:
+                self._image_inflight.pop(access_token, None)
+            else:
+                self._image_inflight[access_token] = inflight - 1
+            lease = self._image_probe_leases.pop(access_token, None)
             current = self._accounts.get(access_token)
             if current is None:
+                self._image_slot_condition.notify_all()
                 return None
             next_item = dict(current)
+            limit = active_image_limit(current)
+            if limit and limit.get("state") == "probing" and lease == limit.get("event_id"):
+                if success:
+                    next_item["image_limit"] = {**limit, "state": "normal", "verified_at": time.time()}
+                    next_item["quota"] = max(1, int(limit.get("reported_quota") or 1))
+                    if next_item.get("status") != "禁用":
+                        next_item["status"] = "正常"
+                    next_item["restore_at"] = None
+                else:
+                    next_item["image_limit"] = {**limit, "state": "awaiting_check", "next_check_at": time.time()+CHECK_RETRY}
             next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if success:
                 next_item["success"] = int(next_item.get("success") or 0) + 1
                 next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
-                if next_item["quota"] == 0:
+                if next_item["quota"] == 0 and next_item.get("status") != "禁用":
                     next_item["status"] = "限流"
                     next_item["restore_at"] = next_item.get("restore_at") or None
                 elif next_item.get("status") == "限流":
@@ -1379,15 +1627,141 @@ class AccountService:
             account = self._normalize_account(next_item)
             if account is None:
                 return None
-            if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
+            if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts and not account.get("image_limit"):
                 self._accounts.pop(access_token, None)
                 self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
+                self._image_slot_condition.notify_all()
                 return None
             self._accounts[access_token] = account
             self._save_accounts()
+            self._image_slot_condition.notify_all()
             return dict(account)
         return None
+
+    def _owns_image_probe(self, access_token: str) -> bool:
+        with self._lock:
+            token = self._resolve_access_token_locked(access_token)
+            account = self._accounts.get(token)
+            limit = active_image_limit(account)
+            return bool(account and account.get("status") != "禁用" and limit and limit.get("state") == "probing"
+                        and self._image_probe_leases.get(token) == limit.get("event_id"))
+
+    def bind_image_probe_conversation(self, access_token: str, conversation_id: str) -> bool:
+        if not isinstance(conversation_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conversation_id):
+            return False
+        with self._lock:
+            token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(token)
+            limit = active_image_limit(current)
+            if (not limit or limit.get("state") != "probing"
+                    or self._image_probe_leases.get(token) != limit.get("event_id")):
+                return False
+            self._accounts[token] = {**current, "image_limit": {**limit, "probe_conversation_id": conversation_id}}
+            self._save_accounts()
+            return True
+
+    def complete_image_probe_from_resume(self, access_token: str, conversation_id: str) -> bool:
+        """验证请求超时后仅仅读取原会话的成功产物，也可完成验证；不重复计费或计数。"""
+        with self._image_slot_condition:
+            token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(token)
+            limit = active_image_limit(current)
+            if (not limit or limit.get("state") not in {"awaiting_check", "probe_ready"}
+                    or not conversation_id or limit.get("probe_conversation_id") != conversation_id):
+                return False
+            quota = max(0, int(limit.get("reported_quota") or 0)-1)
+            status = "禁用" if current.get("status") == "禁用" else "正常" if quota else "限流"
+            self._accounts[token] = self._normalize_account({**current, "quota": quota, "status": status,
+                "restore_at": None, "image_limit": {**limit, "state": "normal", "verified_at": time.time()}})
+            self._save_accounts()
+            self._image_slot_condition.notify_all()
+            return True
+
+    def mark_image_quota_limit(self, access_token: str, evidence) -> dict:
+        record = evidence.record()
+        with self._image_slot_condition:
+            token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(token)
+            if current is None:
+                return record
+            history = dict(current.get("image_limit_events") or {})
+            if record["event_id"] in history:
+                return dict(history[record["event_id"]])
+            # 同一消息可能同时出现在 SSE 和 tasks 读回中，不能因读取来源不同而延长冷却。
+            if record["conversation_id"] and record["message_id"]:
+                for previous in history.values():
+                    if (previous.get("conversation_id") == record["conversation_id"]
+                            and previous.get("message_id") == record["message_id"]):
+                        return dict(previous)
+            history[record["event_id"]] = dict(record)
+            history = dict(list(history.items())[-32:])
+            limit = {**record, "state": "cooldown", "reported_quota": 0, "next_check_at": record["restore_at"]}
+            self._accounts[token] = self._normalize_account({**current, "image_limit": limit, "image_limit_events": history})
+            self._save_accounts()
+            self._image_slot_condition.notify_all()
+        log_service.add(LOG_TYPE_ACCOUNT, "检测到图像限额，账号进入冷却", {
+            "reason": record["reason"], "conversation_id": record["conversation_id"],
+            "occurred_at": self._timestamp_to_iso(record["occurred_at"]), "restore_at": self._timestamp_to_iso(record["restore_at"])})
+        return record
+
+    def _refresh_image_limit(self, access_token: str) -> dict:
+        """初始化额度只用于开放一次业务验证，绝不能直接解除明确限额。"""
+        now = time.time()
+        with self._lock:
+            token = self._resolve_access_token_locked(access_token)
+            current = self._accounts[token]
+            limit = active_image_limit(current)
+            if (not limit or current.get("status") == "禁用" or limit.get("state") == "probing"
+                    or now < float(limit.get("restore_at") or 0) or now < float(limit.get("next_check_at") or 0)):
+                return dict(current)
+            event_id = limit.get("event_id")
+            self._accounts[token] = self._normalize_account({**current, "image_limit": {
+                **limit, "state": "awaiting_check", "next_check_at": now+CHECK_RETRY}})
+            self._save_accounts()
+        from services.openai_backend_api import OpenAIBackendAPI
+        backend = None
+        try:
+            backend = OpenAIBackendAPI(access_token=token)
+            result = backend.get_user_info()
+            if not isinstance(result, dict):
+                raise RuntimeError("invalid quota verification response")
+        except Exception as exc:
+            with self._lock:
+                current = self._accounts.get(self._resolve_access_token_locked(token))
+                limit = active_image_limit(current)
+                if limit and limit.get("event_id") == event_id and limit.get("state") != "probing":
+                    self._accounts[self._resolve_access_token_locked(token)] = self._normalize_account({**current, "image_limit": {
+                        **limit, "state": "awaiting_check", "next_check_at": time.time()+CHECK_RETRY,
+                        "last_checked_at": time.time(), "check_error": type(exc).__name__}})
+                    self._save_accounts()
+            raise
+        finally:
+            if backend is not None:
+                backend.close()
+        remaining = 0
+        for item in result.get("limits_progress") or []:
+            if isinstance(item, dict) and item.get("feature_name") == "image_gen":
+                value = item.get("remaining")
+                if isinstance(value, int) and not isinstance(value, bool):
+                    remaining = max(0, value)
+                break
+        with self._image_slot_condition:
+            token = self._resolve_access_token_locked(token)
+            current = self._accounts.get(token)
+            limit = active_image_limit(current)
+            # 网络请求期间可能产生新限额、被人工禁用或已有验证，旧查询不能覆盖这些决策。
+            if (not limit or limit.get("event_id") != event_id or limit.get("state") == "probing"
+                    or current.get("status") == "禁用"):
+                return dict(current) if current else {}
+            next_limit = {**limit, "state": "probe_ready" if remaining else "awaiting_check", "reported_quota": remaining,
+                          "next_check_at": time.time()+CHECK_RETRY, "last_checked_at": time.time(), "check_error": ""}
+            account = self._normalize_account({**current, **result, "image_limit": next_limit,
+                                               "image_limit_events": current.get("image_limit_events", {})})
+            self._accounts[token] = account
+            self._save_accounts()
+            self._image_slot_condition.notify_all()
+            return dict(account)
 
     def _fetch_firefly_remote_info(
         self,
@@ -1481,10 +1855,14 @@ class AccountService:
             raise ValueError("access_token is required")
 
         _, existing_account = self._get_account_for_token(access_token)
+        if existing_account and existing_account.get("status") == "禁用":
+            return existing_account
         if self._is_firefly_account(existing_account):
             return self._fetch_firefly_remote_info(access_token, event, defer_invalid_removal)
 
         active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
+        if active_image_limit(self.get_account(active_token)):
+            return self._refresh_image_limit(active_token)
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
             backend = OpenAIBackendAPI(active_token)
@@ -1521,7 +1899,7 @@ class AccountService:
                     self.remove_invalid_token(active_token, event)
                 raise
         self._record_refresh_success(active_token)
-        return self.update_account(active_token, result)
+        return self.update_account(active_token, result, remote=True)
 
     # ---- 刷新进度追踪 ----
 

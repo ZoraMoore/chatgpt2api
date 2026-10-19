@@ -11,6 +11,30 @@ from curl_cffi.requests import Session
 
 
 SUB2API_USER_AGENT = "chatgpt2api-sub2api/1.0"
+_ACCOUNT_PATH_ALIASES = {
+    "/api/v1/admin/accounts": "/api/v1/admin/providers",
+    "/api/v1/admin/accounts/data": "/api/v1/admin/providers/data",
+}
+
+
+def get_compatible_admin_response(
+    session: Session,
+    base_url: str,
+    path: str,
+    *,
+    headers: dict[str, str],
+    params: dict | None = None,
+):
+    response = session.get(
+        f"{base_url}{path}", headers=headers, params=params, timeout=30,
+    )
+    alternate_path = _ACCOUNT_PATH_ALIASES.get(path)
+    # TokenRouter 将账号接口改名为 providers；只对不存在的接口回退，保留权限错误。
+    if response.status_code == 404 and alternate_path:
+        response = session.get(
+            f"{base_url}{alternate_path}", headers=headers, params=params, timeout=30,
+        )
+    return response
 
 
 class Sub2APISessionError(RuntimeError):
@@ -133,11 +157,12 @@ class Sub2APISessionManager:
 
     def authorized_get(self, server: dict, path: str, *, params: dict | None = None):
         state = self._require_state(_clean(server.get("id")))
-        response = state.session.get(
-            f"{state.base_url}{path}",
+        response = get_compatible_admin_response(
+            state.session,
+            state.base_url,
+            path,
             headers=self._authorized_headers(state),
             params=params,
-            timeout=30,
         )
         if not response.ok:
             self._raise_authorized_error(server, response)
@@ -153,6 +178,9 @@ class Sub2APISessionManager:
             params={"ids": ",".join(ids), "include_proxies": "false"},
         )
         body = self._response_body(response, "UPSTREAM_ERROR")
+        # 对外保持现有 accounts 结构，兼容 TokenRouter 导出的 providers 字段。
+        if isinstance(body, dict) and "accounts" not in body and isinstance(body.get("providers"), list):
+            body = {**body, "accounts": body["providers"]}
         if not isinstance(body, dict) or not isinstance(body.get("accounts"), list):
             raise Sub2APISessionError("UPSTREAM_ERROR", "Sub2API export response is invalid")
         return body

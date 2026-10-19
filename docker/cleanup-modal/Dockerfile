@@ -1,0 +1,11 @@
+FROM local/chatgpt2api-image:admin-fixes-20261016
+COPY ["api/app.py", "/app/api/app.py"]
+COPY ["api/image_space.py", "/app/api/image_space.py"]
+COPY ["services/image_space_service.py", "/app/services/image_space_service.py"]
+COPY ["web/account-image-cleanup.js", "/app/web/account-image-cleanup.js"]
+COPY ["web/account-image-space.js", "/app/web/account-image-space.js"]
+COPY ["web_dist/_next/static/chunks/session-import-339bb107e844.js", "/app/web_dist/_next/static/chunks/session-import-339bb107e844.js"]
+COPY ["web_dist/accounts/__next._full.txt", "/app/web_dist/accounts/__next._full.txt"]
+COPY ["web_dist/accounts/__next.accounts.__PAGE__.txt", "/app/web_dist/accounts/__next.accounts.__PAGE__.txt"]
+COPY ["web_dist/accounts/index.html", "/app/web_dist/accounts/index.html"]
+COPY ["web_dist/accounts/index.txt", "/app/web_dist/accounts/index.txt"]

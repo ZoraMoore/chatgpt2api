@@ -1,16 +1,74 @@
+name: chatgpt2api-image
+
 services:
-  chatgpt2api:
-    build: .
-    container_name: chatgpt2api
+  chatgpt2api-image:
+    # 同步主站已验证的运行镜像，保留本站独立配置和数据。
+    image: local/chatgpt2api-image:quota-cooldown-20261016
+    container_name: chatgpt2api-image
     restart: unless-stopped
+    stop_grace_period: 120s
     ports:
-      - "127.0.0.1:8088:80"
+      - "127.0.0.1:8089:80"
+    # 限制二开实例资源，降低对同机客户服务的影响。
+    cpus: 1.5
+    mem_limit: 1g
+    pids_limit: 256
     environment:
       STORAGE_BACKEND: json
-      CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:?请在 .env 中设置管理员密钥}
+      CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:?请在 .env 中设置新站独立管理员密钥}
+      CHATGPT2API_LOG_MAX_BYTES: ${CHATGPT2API_LOG_MAX_BYTES:-67108864}
+      CHATGPT2API_LOG_BACKUP_COUNT: ${CHATGPT2API_LOG_BACKUP_COUNT:-2}
+      CHATGPT2API_IMAGE_WORKER_LIMIT: ${CHATGPT2API_IMAGE_WORKER_LIMIT:-4}
+      # 后台尚未保存生图模式时默认使用语音模式。
+      CHATGPT2API_IMAGE_TRANSPORT: voice
     volumes:
-      - ./config.json:/app/config.json:ro
-      - chatgpt2api-data:/app/data
+      # 管理后台需要写入配置；此文件只属于新站，不复用老站配置。
+      - ./config.json:/app/config.json
+      - image-data:/app/data
+    healthcheck:
+      # 空账号池会使 /health 返回 degraded，用 /version 判断进程可用性。
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1/version', timeout=5).read()"]
+      interval: 30s
+      timeout: 8s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  image-sentinel:
+    # 仅供显式回退旧协议时使用；正式语音路径不启动浏览器服务。
+    profiles: [legacy-sentinel]
+    image: local/chatgpt2api-image-sentinel:lfl9h1ji
+    container_name: chatgpt2api-image-sentinel
+    restart: unless-stopped
+    # 网络隔离；通过私有 socket 加载预热页面并计算校验。
+    network_mode: none
+    read_only: true
+    user: "1000:1000"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 1
+    mem_limit: 768m
+    pids_limit: 256
+    tmpfs:
+      - /tmp:rw,size=256m,mode=1777
+    volumes:
+      - sentinel-socket:/run/sentinel
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get({socketPath:'/run/sentinel/worker.sock',path:'/health'},r=>{r.resume();process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
 
 volumes:
-  chatgpt2api-data:
+  image-data:
+  sentinel-socket:
