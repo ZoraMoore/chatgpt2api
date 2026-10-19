@@ -22,3 +22,10 @@ __pycache__/
 
 # 浏览器校验运行时（不含项目源码）
 /.runtime/sentinel/
+
+# 可构建前端的依赖与中间产物
+/frontend/node_modules/
+/frontend/.next/
+/frontend/out/
+/frontend/next-env.d.ts
+/frontend/*.tsbuildinfo

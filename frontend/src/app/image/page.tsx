@@ -1,0 +1,1993 @@
+"use client";
+
+import { Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { ArrowDown, History, LoaderCircle, Plus, Sparkles, Trash2 } from "lucide-react";
+import { toast } from "sonner";
+
+import { ImageComposer } from "@/app/image/components/image-composer";
+import { ImageResults, type ImageLightboxItem } from "@/app/image/components/image-results";
+import { ImageSidebar } from "@/app/image/components/image-sidebar";
+import { ImageLightbox } from "@/components/image-lightbox";
+import { PageHeader } from "@/components/page-header";
+import { PageLoader } from "@/components/page-loader";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { resolveImageTaskLink, validLinkedTaskId } from "./task-deep-link";
+import {
+  createImageEditTask,
+  createImageGenerationTask,
+  fetchAccounts,
+  fetchModels,
+  fetchImageTasks,
+  resumeImagePoll,
+  type Account,
+  type ImageModel,
+  type Model,
+  type ImageTask,
+} from "@/lib/api";
+import { useAuthGuard } from "@/lib/use-auth-guard";
+import { useSettingsStore } from "@/app/settings/store";
+import {
+  clearImageConversations,
+  deleteImageConversation,
+  getImageConversationStats,
+  hasPersistentConversationChanges,
+  listImageConversations,
+  renameImageConversation,
+  saveImageConversation,
+  saveImageConversations,
+  type ImageConversation,
+  type ImageConversationMode,
+  type ImageTurn,
+  type ImageTurnStatus,
+  type StoredImage,
+  type StoredReferenceImage,
+} from "@/store/image-conversations";
+
+const ACTIVE_CONVERSATION_STORAGE_KEY = "chatgpt2api:image_active_conversation_id";
+const IMAGE_RATIO_STORAGE_KEY = "chatgpt2api:image_last_ratio";
+const IMAGE_TIER_STORAGE_KEY = "chatgpt2api:image_last_tier";
+const IMAGE_QUALITY_STORAGE_KEY = "chatgpt2api:image_last_quality";
+const IMAGE_MODEL_STORAGE_KEY = "chatgpt2api:image_last_model";
+const IMAGE_COUNT_STORAGE_KEY = "chatgpt2api:image_last_count";
+const SCROLL_POSITIONS_STORAGE_KEY = "chatgpt2api:image_scroll_positions";
+const SCROLL_TO_LATEST_THRESHOLD = 160;
+// 后端未返回默认生图模型时的兜底值
+const DEFAULT_IMAGE_MODEL = "gpt-image-2";
+
+function loadScrollPositions(): Map<string, number> {
+  if (typeof window === "undefined") return new Map();
+  try {
+    const raw = window.sessionStorage.getItem(SCROLL_POSITIONS_STORAGE_KEY);
+    if (!raw) return new Map();
+    const parsed = JSON.parse(raw) as Record<string, number>;
+    return new Map(Object.entries(parsed));
+  } catch {
+    return new Map();
+  }
+}
+
+function saveScrollPositions(positions: Map<string, number>) {
+  if (typeof window === "undefined") return;
+  try {
+    const obj: Record<string, number> = {};
+    positions.forEach((value, key) => { obj[key] = value; });
+    window.sessionStorage.setItem(SCROLL_POSITIONS_STORAGE_KEY, JSON.stringify(obj));
+  } catch {
+    // sessionStorage may be full or unavailable
+  }
+}
+
+function clampImageCount(value: string) {
+  return String(Math.min(100, Math.max(1, Math.floor(Number(value) || 1))));
+}
+function parseImageSize(size: string) {
+  const match = size.match(/^(\d+)x(\d+)$/);
+  return match ? { width: match[1], height: match[2] } : { width: "1024", height: "1024" };
+}
+
+const activeConversationQueueIds = new Set<string>();
+
+function notifyTaskUpdate() {
+  // 事件只通知任务中心重新查询，不把提示词、图片或管理凭据广播到页面。
+  window.dispatchEvent(new CustomEvent("chatgpt2api:tasks-updated"));
+}
+let pollAbortController: AbortController | null = null;
+
+function getResultsDistanceFromBottom(element: HTMLElement) {
+  return element.scrollHeight - element.scrollTop - element.clientHeight;
+}
+
+function buildConversationTitle(prompt: string) {
+  const trimmed = prompt.trim();
+  if (trimmed.length <= 12) {
+    return trimmed;
+  }
+  return `${trimmed.slice(0, 12)}...`;
+}
+
+function formatConversationTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function formatAvailableQuota(accounts: Account[]) {
+  const availableAccounts = accounts.filter((account) => account.status !== "禁用");
+  return String(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
+}
+
+function createId() {
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function readFileAsDataUrl(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("读取参考图失败"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function dataUrlToFile(dataUrl: string, fileName: string, mimeType?: string) {
+  const [header, content] = dataUrl.split(",", 2);
+  const matchedMimeType = header.match(/data:(.*?);base64/)?.[1];
+  const binary = atob(content || "");
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new File([bytes], fileName, { type: mimeType || matchedMimeType || "image/png" });
+}
+
+function filterImageModels(items: Model[]): ImageModel[] {
+  return items
+    .map((item) => String(item.id || "").trim())
+    .filter((id, index, list) => id.toLowerCase().includes("image") && list.indexOf(id) === index);
+}
+
+function normalizeStoredImageModel(
+  value: string | null,
+  availableModels: ImageModel[],
+  fallbackModel: ImageModel,
+): ImageModel {
+  const normalized = String(value || "").trim();
+  if (normalized && availableModels.includes(normalized)) {
+    return normalized;
+  }
+  if (fallbackModel && availableModels.includes(fallbackModel)) {
+    return fallbackModel;
+  }
+  return availableModels[0] || DEFAULT_IMAGE_MODEL;
+}
+
+function buildReferenceImageFromResult(image: StoredImage, fileName: string): StoredReferenceImage | null {
+  if (!image.b64_json) {
+    return null;
+  }
+
+  return {
+    name: fileName,
+    type: "image/png",
+    dataUrl: `data:image/png;base64,${image.b64_json}`,
+  };
+}
+
+async function fetchImageAsFile(url: string, fileName: string) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error("读取结果图失败");
+  }
+  const blob = await response.blob();
+  return new File([blob], fileName, { type: blob.type || "image/png" });
+}
+
+async function buildReferenceImageFromStoredImage(image: StoredImage, fileName: string) {
+  const direct = buildReferenceImageFromResult(image, fileName);
+  if (direct) {
+    return {
+      referenceImage: direct,
+      file: dataUrlToFile(direct.dataUrl, direct.name, direct.type),
+    };
+  }
+
+  if (!image.url) {
+    return null;
+  }
+  const file = await fetchImageAsFile(image.url, fileName);
+  return {
+    referenceImage: {
+      name: file.name,
+      type: file.type || "image/png",
+      dataUrl: await readFileAsDataUrl(file),
+    },
+    file,
+  };
+}
+
+function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage {
+  if (task.status === "success") {
+    const first = task.data?.[0];
+    if (!first?.b64_json && !first?.url) {
+      return {
+        ...image,
+        taskId: task.id,
+        status: "error",
+        taskStatus: undefined,
+        progress: undefined,
+        error: "未返回图片数据",
+      };
+    }
+    return {
+      ...image,
+      taskId: task.id,
+      status: "success",
+      taskStatus: undefined,
+      progress: undefined,
+      b64_json: first.b64_json,
+      url: first.url,
+      revised_prompt: first.revised_prompt,
+      error: undefined,
+      durationMs: task.duration_ms,
+    };
+  }
+
+  if (task.status === "error") {
+    return {
+      ...image,
+      taskId: task.id,
+      status: "error",
+      taskStatus: undefined,
+      progress: undefined,
+      error: task.error || "生成失败",
+      durationMs: task.duration_ms,
+    };
+  }
+
+  const newTaskStatus = task.status === "queued" ? "queued" : task.status === "running" ? "running" : image.taskStatus;
+  const shouldSetStartTime = newTaskStatus === "running" && !image.startTime;
+  const startTime = shouldSetStartTime ? Date.now() : image.startTime;
+  // elapsedSecs 仅使用后端返回的值，确保计时从 image_stream_resolve_start 开始
+  const elapsedSecs =
+    newTaskStatus === "running" && typeof task.elapsed_secs === "number"
+      ? task.elapsed_secs
+      : undefined;
+
+  return {
+    ...image,
+    taskId: task.id,
+    status: "loading",
+    taskStatus: newTaskStatus,
+    progress: task.progress || image.progress,
+    error: undefined,
+    startTime,
+    elapsedSecs,
+    elapsedUpdatedAt: elapsedSecs != null ? Date.now() : undefined,
+  };
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+// 轮询退避：前台 2s，页面隐藏时降频到 10s，减少后台无效请求
+function pollDelayMs() {
+  return typeof document !== "undefined" && document.visibilityState === "hidden" ? 10000 : 2000;
+}
+
+function pickFallbackConversationId(conversations: ImageConversation[]) {
+  const activeConversation = conversations.find((conversation) =>
+    conversation.turns.some((turn) => turn.status === "queued" || turn.status === "generating"),
+  );
+  return activeConversation?.id ?? conversations[0]?.id ?? null;
+}
+
+function sortImageConversations(conversations: ImageConversation[]) {
+  return [...conversations].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+function deriveTurnStatus(turn: ImageTurn): Pick<ImageTurn, "status" | "error"> {
+  const loadingCount = turn.images.filter((image) => image.status === "loading").length;
+  const failedCount = turn.images.filter((image) => image.status === "error").length;
+  const successCount = turn.images.filter((image) => image.status === "success").length;
+  if (loadingCount > 0) {
+    // 如果任何图片的 taskStatus 为 running，则状态为 generating
+    const hasRunning = turn.images.some((image) => image.taskStatus === "running");
+    if (hasRunning) {
+      return { status: "generating", error: undefined };
+    }
+    return { status: turn.status === "queued" ? "queued" : "generating", error: undefined };
+  }
+  if (failedCount > 0) {
+    return { status: "error", error: `其中 ${failedCount} 张未成功生成` };
+  }
+  if (successCount > 0) {
+    return { status: "success", error: undefined };
+  }
+  // 所有图片都被忽略（images 为空），视为完成
+  return { status: "success", error: undefined };
+}
+
+function finalizeIdleQueuedTurn(turn: ImageTurn): ImageTurn {
+  if (
+    (turn.status !== "queued" && turn.status !== "generating") ||
+    turn.images.some((image) => image.status === "loading")
+  ) {
+    return turn;
+  }
+  const derived = deriveTurnStatus(turn);
+  if (derived.status === turn.status && derived.error === turn.error) {
+    return turn;
+  }
+  return {
+    ...turn,
+    ...derived,
+  };
+}
+
+async function syncConversationImageTasks(items: ImageConversation[]) {
+  const taskIds = Array.from(
+    new Set(
+      items.flatMap((conversation) =>
+        conversation.turns.flatMap((turn) =>
+          turn.resultsDeleted
+            ? []
+            : turn.images.flatMap((image) =>
+                (image.status === "loading" || (image.status === "error" && image.taskId))
+                  ? [image.taskId!]
+                  : [],
+              ),
+        ),
+      ),
+    ),
+  );
+  if (taskIds.length === 0) {
+    return items;
+  }
+
+  let taskList: Awaited<ReturnType<typeof fetchImageTasks>>;
+  let queryFailed = false;
+  try {
+    taskList = await fetchImageTasks(taskIds);
+  } catch {
+    queryFailed = true;
+    taskList = { items: [], missing_ids: [] };
+  }
+  const taskMap = new Map(taskList.items.map((task) => [task.id, task]));
+  let changed = false;
+  const normalized = items.map((conversation) => {
+    const turns = conversation.turns.map((turn) => {
+      let turnChanged = false;
+      const images = turn.images.map((image) => {
+        if (!image.taskId) {
+          return image;
+        }
+        if (image.status !== "loading" && image.status !== "error") {
+          return image;
+        }
+        const task = taskMap.get(image.taskId);
+        if (!task) {
+          if (image.status === "loading" && (queryFailed || taskList.missing_ids.includes(image.taskId))) {
+            turnChanged = true;
+            return {
+              ...image,
+              status: "error" as const,
+              taskStatus: undefined,
+              error: queryFailed
+                ? "任务状态无法确认，请刷新页面重新查询；也可手动重新生成新任务。"
+                : "任务记录不存在或已过期，已保留原任务 ID；如需再生成，请手动创建新任务。",
+            };
+          }
+          return image;
+        }
+        const nextImage = taskDataToStoredImage(image, task);
+        if (nextImage !== image) {
+          turnChanged = true;
+        }
+        return nextImage;
+      });
+      if (!turnChanged) {
+        return turn;
+      }
+      changed = true;
+      const derived = deriveTurnStatus({ ...turn, images });
+      return {
+        ...turn,
+        ...derived,
+        images,
+      };
+    });
+    if (turns === conversation.turns || !turns.some((turn, index) => turn !== conversation.turns[index])) {
+      return conversation;
+    }
+    return {
+      ...conversation,
+      turns,
+      updatedAt: new Date().toISOString(),
+    };
+  });
+
+  if (changed) {
+    // 只写入真正被修改过的会话（未修改的会话对象引用保持不变），不要把整个历史再写一遍
+    await saveImageConversations(normalized.filter((conversation, index) => conversation !== items[index]));
+  }
+  return normalized;
+}
+
+async function recoverConversationHistory(items: ImageConversation[]) {
+  let changed = false;
+  const normalized = items.map((conversation) => {
+    const turns = conversation.turns.map((turn) => {
+      if (turn.status !== "queued" && turn.status !== "generating" && turn.status !== "error") {
+        return turn;
+      }
+
+      let turnChanged = false;
+      const images = turn.images.map((image) => {
+        if (image.status !== "loading" || image.taskId) {
+          return image;
+        }
+        turnChanged = true;
+        return {
+          ...image,
+          status: "error" as const,
+          error: "页面刷新或任务中断，未找到可恢复的任务 ID",
+        };
+      });
+      const candidateTurn = turnChanged ? { ...turn, images } : turn;
+      const nextTurn = finalizeIdleQueuedTurn(candidateTurn);
+      const derived = turnChanged ? deriveTurnStatus(nextTurn) : { status: nextTurn.status, error: nextTurn.error };
+      if (!turnChanged && nextTurn === turn && derived.status === turn.status && derived.error === turn.error) {
+        return turn;
+      }
+      changed = true;
+      return {
+        ...nextTurn,
+        ...derived,
+      };
+    });
+
+    if (!turns.some((turn, index) => turn !== conversation.turns[index])) {
+      return conversation;
+    }
+
+    return {
+      ...conversation,
+      turns,
+      updatedAt: new Date().toISOString(),
+    };
+  });
+
+  if (changed) {
+    await saveImageConversations(normalized.filter((conversation, index) => conversation !== items[index]));
+  }
+
+  return syncConversationImageTasks(normalized);
+}
+
+
+function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
+  const searchParams = useSearchParams();
+  const linkedTaskId = searchParams.get("task_id");
+  const linkedTaskDismissedRef = useRef(false);
+  const [linkedServerTask, setLinkedServerTask] = useState<ImageTask | null>(null);
+  const [linkedTaskMessage, setLinkedTaskMessage] = useState("");
+  const didLoadQuotaRef = useRef(false);
+  const conversationsRef = useRef<ImageConversation[]>([]);
+  const loadCancelledRef = useRef(false);
+  const resumingConversationIdsRef = useRef(new Set<string>());
+  const resumingTaskIdsRef = useRef(new Set<string>());
+  // 只有当前页面里由用户明确创建的新 ID 有一次首次提交资格；刷新与查询不能恢复此资格。
+  const pendingSubmissionTaskIdsRef = useRef(new Set<string>());
+  const resultsViewportRef = useRef<HTMLDivElement>(null);
+  const lastConversationIdRef = useRef<string | null>(null);
+  const shouldStickToBottomRef = useRef(true);
+  const scrollRafRef = useRef<number | null>(null);
+  const scrollSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const scrollPositionsRef = useRef<Map<string, number>>(loadScrollPositions());
+  const isRestoringScrollRef = useRef(false);
+  const scrollRestoreGenerationRef = useRef(0);
+
+  const config = useSettingsStore((state) => state.config);
+  const imageTimeoutRetrySecs = Number(config?.image_timeout_retry_secs || 30);
+
+  const [imagePrompt, setImagePrompt] = useState("");
+  const [imageCount, setImageCount] = useState("3");
+  const [imageRatio, setImageRatio] = useState("auto");
+  const [imageTier, setImageTier] = useState("1k");
+  const [imageWidth, setImageWidth] = useState("1024");
+  const [imageHeight, setImageHeight] = useState("1024");
+  const [imageQuality, setImageQuality] = useState("auto");
+  const [imageModel, setImageModel] = useState<ImageModel>(DEFAULT_IMAGE_MODEL);
+  const [imageModels, setImageModels] = useState<ImageModel[]>([DEFAULT_IMAGE_MODEL]);
+  const didChooseImageModelRef = useRef(false);
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [referenceImageFiles, setReferenceImageFiles] = useState<File[]>([]);
+  const [referenceImages, setReferenceImages] = useState<StoredReferenceImage[]>([]);
+  const [conversations, setConversations] = useState<ImageConversation[]>([]);
+  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(true);
+  const [availableQuota, setAvailableQuota] = useState("加载中...");
+  const [lightboxImages, setLightboxImages] = useState<ImageLightboxItem[]>([]);
+  const [lightboxOpen, setLightboxOpen] = useState(false);
+  const [lightboxIndex, setLightboxIndex] = useState(0);
+  const scrollToLatestBtnRef = useRef<HTMLButtonElement>(null);
+  const [deleteConfirm, setDeleteConfirm] = useState<
+    | { type: "one"; id: string }
+    | { type: "prompt"; conversationId: string; turnId: string }
+    | { type: "results"; conversationId: string; turnId: string }
+    | { type: "all" }
+    | null
+  >(null);
+  const [timeoutRetry, setTimeoutRetry] = useState<{
+    conversationId: string;
+    taskId: string;
+    taskError: string;
+  } | null>(null);
+
+  const parsedCount = useMemo(() => Number(clampImageCount(imageCount)), [imageCount]);
+  const selectedConversation = useMemo(
+    () => conversations.find((item) => item.id === selectedConversationId) ?? null,
+    [conversations, selectedConversationId],
+  );
+
+  useEffect(() => {
+    if (isLoadingHistory) return;
+    linkedTaskDismissedRef.current = false;
+    setLinkedServerTask(null);
+    if (!linkedTaskId) { setLinkedTaskMessage(""); return; }
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    setLinkedTaskMessage("正在定位指定任务…");
+    const readLinkedTask = async () => {
+      if (linkedTaskDismissedRef.current) return;
+      try {
+        const result = await resolveImageTaskLink(linkedTaskId, conversationsRef.current, fetchImageTasks);
+        if (cancelled || linkedTaskDismissedRef.current) return;
+        if (result.kind === "local") {
+          setSelectedConversationId(result.conversationId);
+          setLinkedTaskMessage("");
+        } else if (result.kind === "remote") {
+          setLinkedServerTask(result.task);
+          setLinkedTaskMessage("");
+          if (result.task.status === "queued" || result.task.status === "running") timer = setTimeout(() => void readLinkedTask(), 5000);
+        } else {
+          setLinkedTaskMessage(result.kind === "invalid" ? "任务链接中的 ID 无效。" : "未找到指定任务，任务可能已过期或不属于当前账户。");
+        }
+      } catch {
+        if (!cancelled && !linkedTaskDismissedRef.current) setLinkedTaskMessage("暂时无法读取指定任务，请刷新后重试。");
+      }
+    };
+    void readLinkedTask();
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+  }, [linkedTaskId, isLoadingHistory]);
+
+  useEffect(() => {
+    if (!validLinkedTaskId(linkedTaskId) || isLoadingHistory || !selectedConversation?.turns.some((turn) => turn.images.some((image) => (image.taskId || image.id) === linkedTaskId))) return;
+    let frame = requestAnimationFrame(() => {
+      frame = requestAnimationFrame(() => {
+        const image = Array.from(resultsViewportRef.current?.querySelectorAll<HTMLElement>("[data-image-task-id]") || []).find((node) => node.dataset.imageTaskId === linkedTaskId);
+        image?.scrollIntoView({ block: "center", behavior: "instant" });
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [linkedTaskId, selectedConversation?.id, isLoadingHistory]);
+
+  const selectLocalConversation = useCallback((id: string) => {
+    linkedTaskDismissedRef.current = true;
+    setLinkedServerTask(null);
+    setLinkedTaskMessage("");
+    setSelectedConversationId(id);
+  }, []);
+  const activeTaskCount = useMemo(
+    () =>
+      conversations.reduce((sum, conversation) => {
+        const stats = getImageConversationStats(conversation);
+        return sum + stats.queued + stats.running;
+      }, 0),
+    [conversations],
+  );
+  const deleteConfirmTitle =
+    deleteConfirm?.type === "all"
+      ? "清空历史记录"
+      : deleteConfirm?.type === "prompt"
+        ? "删除提示词记录"
+        : deleteConfirm?.type === "results"
+          ? "删除生成结果"
+          : deleteConfirm?.type === "one"
+            ? "删除对话"
+            : "";
+  const deleteConfirmDescription =
+    deleteConfirm?.type === "all"
+      ? "确认删除全部图片历史记录吗？删除后无法恢复。"
+      : deleteConfirm?.type === "prompt"
+        ? "确认删除这条提示词记录吗？对应生成结果会保留。"
+        : deleteConfirm?.type === "results"
+          ? "确认删除这条生成结果吗？对应提示词记录会保留。"
+          : deleteConfirm?.type === "one"
+            ? "确认删除这条图片对话吗？删除后无法恢复。"
+            : "";
+
+  useEffect(() => {
+    conversationsRef.current = conversations;
+  }, [conversations]);
+
+  const scrollResultsToLatest = useCallback((behavior: ScrollBehavior = "smooth") => {
+    const element = resultsViewportRef.current;
+    if (!element) {
+      return;
+    }
+
+    shouldStickToBottomRef.current = true;
+    const btn = scrollToLatestBtnRef.current;
+    if (btn) btn.style.display = "none";
+    element.scrollTo({
+      top: element.scrollHeight,
+      behavior,
+    });
+  }, []);
+
+  const handleResultsScroll = useCallback(() => {
+    if (scrollRafRef.current !== null) {
+      return;
+    }
+
+    scrollRafRef.current = window.requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      const element = resultsViewportRef.current;
+      if (!element) {
+        return;
+      }
+
+      // 恢复滚动位置期间不处理滚动事件
+      if (isRestoringScrollRef.current) {
+        return;
+      }
+
+      // 保存当前会话的滚动位置（debounce 300ms 写入 sessionStorage）
+      const convId = lastConversationIdRef.current;
+      if (convId) {
+        scrollPositionsRef.current.set(convId, element.scrollTop);
+        if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
+        scrollSaveTimerRef.current = setTimeout(() => {
+          scrollSaveTimerRef.current = null;
+          saveScrollPositions(scrollPositionsRef.current);
+        }, 300);
+      }
+
+      const isAwayFromLatest = getResultsDistanceFromBottom(element) > SCROLL_TO_LATEST_THRESHOLD;
+      shouldStickToBottomRef.current = !isAwayFromLatest;
+      // 直接操作 DOM 控制按钮显隐，避免 setState 触发全组件重渲染
+      const btn = scrollToLatestBtnRef.current;
+      if (btn) {
+        if (isAwayFromLatest) {
+          btn.style.display = "";
+        } else {
+          btn.style.display = "none";
+        }
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (scrollRafRef.current !== null) {
+        window.cancelAnimationFrame(scrollRafRef.current);
+      }
+      if (scrollSaveTimerRef.current !== null) {
+        clearTimeout(scrollSaveTimerRef.current);
+        saveScrollPositions(scrollPositionsRef.current);
+      }
+    };
+  }, []);
+
+  const loadHistory = useCallback(async () => {
+    try {
+      const storedRatio =
+        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_RATIO_STORAGE_KEY) : null;
+      const storedTier =
+        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_TIER_STORAGE_KEY) : null;
+      const storedQuality =
+        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_QUALITY_STORAGE_KEY) : null;
+      const storedCount =
+        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_COUNT_STORAGE_KEY) : null;
+      setImageRatio(storedRatio || "1:1");
+      setImageTier(storedTier || "1k");
+      setImageWidth("1024");
+      setImageHeight("1024");
+      setImageQuality(storedQuality || "auto");
+      setImageCount(storedCount ? clampImageCount(storedCount) : "1");
+
+      const items = await listImageConversations();
+      const normalizedItems = await recoverConversationHistory(items);
+      if (loadCancelledRef.current) {
+        return;
+      }
+
+      conversationsRef.current = normalizedItems;
+      setConversations(normalizedItems);
+      const storedConversationId =
+        typeof window !== "undefined" ? window.localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY) : null;
+      const nextSelectedConversationId =
+        (storedConversationId && normalizedItems.some((conversation) => conversation.id === storedConversationId)
+          ? storedConversationId
+          : null) ?? pickFallbackConversationId(normalizedItems);
+      setSelectedConversationId(nextSelectedConversationId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "读取会话记录失败";
+      toast.error(message);
+    } finally {
+      if (!loadCancelledRef.current) {
+        setIsLoadingHistory(false);
+      }
+    }
+  }, [
+    setImageRatio,
+    setImageTier,
+    setImageWidth,
+    setImageHeight,
+    setImageQuality,
+    setImageCount,
+    setConversations,
+    setSelectedConversationId,
+    setIsLoadingHistory,
+  ]);
+
+  // Handle bfcache (back/forward cache) — re-sync task status on page restore
+  useEffect(() => {
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) {
+        void loadHistory();
+      }
+    };
+    window.addEventListener("pageshow", handlePageShow);
+    return () => window.removeEventListener("pageshow", handlePageShow);
+  }, [loadHistory]);
+
+  useEffect(() => {
+    loadCancelledRef.current = false;
+    void loadHistory();
+    return () => {
+      loadCancelledRef.current = true;
+      // 组件卸载时保存当前滚动位置到 sessionStorage
+      const element = resultsViewportRef.current;
+      const convId = lastConversationIdRef.current;
+      if (element && convId) {
+        scrollPositionsRef.current.set(convId, element.scrollTop);
+        saveScrollPositions(scrollPositionsRef.current);
+      }
+      activeConversationQueueIds.clear();
+      if (pollAbortController) {
+        pollAbortController.abort();
+        pollAbortController = null;
+      }
+    };
+  }, [loadHistory]);
+
+  const handleImageModelChange = useCallback((value: ImageModel) => {
+    didChooseImageModelRef.current = true;
+    setImageModel(value);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadImageModels = async () => {
+      try {
+        const data = await fetchModels();
+        const available = filterImageModels(Array.isArray(data.data) ? data.data : []);
+        if (cancelled || available.length === 0) {
+          return;
+        }
+        setImageModels(available);
+        const storedModel = typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_MODEL_STORAGE_KEY) : null;
+        const defaultModel = String(data.default_image_model || "").trim();
+        setImageModel((current) => {
+          // 已经加载完型号后用户手动切换过，保留用户当前选择
+          if (didChooseImageModelRef.current && available.includes(current)) {
+            return current;
+          }
+          return normalizeStoredImageModel(storedModel, available, defaultModel);
+        });
+      } catch {
+        if (!cancelled) {
+          setImageModels([DEFAULT_IMAGE_MODEL]);
+        }
+      }
+    };
+
+    void loadImageModels();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const loadQuota = useCallback(async () => {
+    if (!isAdmin) {
+      setAvailableQuota("--");
+      return;
+    }
+    try {
+      const data = await fetchAccounts();
+      setAvailableQuota(formatAvailableQuota(data.items));
+    } catch {
+      setAvailableQuota((prev) => (prev === "加载中..." ? "--" : prev));
+    }
+  }, [isAdmin]);
+
+  useEffect(() => {
+    if (didLoadQuotaRef.current) {
+      return;
+    }
+    didLoadQuotaRef.current = true;
+
+    const handleFocus = () => {
+      void loadQuota();
+    };
+
+    void loadQuota();
+    window.addEventListener("focus", handleFocus);
+    return () => {
+      window.removeEventListener("focus", handleFocus);
+    };
+  }, [isAdmin, loadQuota]);
+
+  // 切换会话时保存旧会话滚动位置，并隐藏容器防止闪烁
+  useLayoutEffect(() => {
+    if (!selectedConversation) {
+      lastConversationIdRef.current = null;
+      shouldStickToBottomRef.current = true;
+      const btn = scrollToLatestBtnRef.current;
+      if (btn) btn.style.display = "none";
+      return;
+    }
+
+    const element = resultsViewportRef.current;
+    if (!element) {
+      return;
+    }
+
+    const didSwitchConversation = lastConversationIdRef.current !== selectedConversation.id;
+
+    if (didSwitchConversation) {
+      // 递增 generation，使之前未完成的 rAF 回调失效
+      scrollRestoreGenerationRef.current += 1;
+
+      // 先保存旧会话的滚动位置（lastConversationIdRef 还是旧值）
+      const oldConvId = lastConversationIdRef.current;
+      if (oldConvId) {
+        scrollPositionsRef.current.set(oldConvId, element.scrollTop);
+        saveScrollPositions(scrollPositionsRef.current);
+      }
+      // 更新为新会话 ID
+      lastConversationIdRef.current = selectedConversation.id;
+
+      // 如果有保存的滚动位置，隐藏容器防止用户看到 scrollTop=0 的内容
+      const savedScrollTop = scrollPositionsRef.current.get(selectedConversation.id);
+      if (savedScrollTop != null && savedScrollTop > 0) {
+        element.style.visibility = "hidden";
+        isRestoringScrollRef.current = true;
+      }
+    }
+  }, [selectedConversation?.id]);
+
+  // 恢复滚动位置或跟随最新内容
+  useEffect(() => {
+    if (!selectedConversation) {
+      return;
+    }
+
+    const element = resultsViewportRef.current;
+    if (!element) {
+      return;
+    }
+
+    const savedScrollTop = scrollPositionsRef.current.get(selectedConversation.id);
+
+    if (savedScrollTop != null && savedScrollTop > 0) {
+      // 捕获当前 generation，用于检测是否已被新的切换取代
+      const generation = scrollRestoreGenerationRef.current;
+      // 容器已在 useLayoutEffect 中设为 visibility:hidden，用户看不到滚动过程
+      requestAnimationFrame(() => {
+        // 如果 generation 已变，说明用户又切换了，放弃本次恢复
+        if (scrollRestoreGenerationRef.current !== generation) return;
+        element.scrollTop = savedScrollTop;
+        // 再等一帧确保 scrollTop 生效后再显示容器
+        requestAnimationFrame(() => {
+          // 再次检查 generation
+          if (scrollRestoreGenerationRef.current !== generation) return;
+          const isAwayFromLatest = getResultsDistanceFromBottom(element) > SCROLL_TO_LATEST_THRESHOLD;
+          shouldStickToBottomRef.current = !isAwayFromLatest;
+          const btn = scrollToLatestBtnRef.current;
+          if (btn) btn.style.display = isAwayFromLatest ? "" : "none";
+          // 显示容器 — 用户直接看到正确位置的内容
+          element.style.visibility = "";
+          isRestoringScrollRef.current = false;
+        });
+      });
+      // 恢复后清除保存的位置，下次内容更新时走正常的 shouldFollowLatest 逻辑
+      scrollPositionsRef.current.delete(selectedConversation.id);
+      return;
+    }
+
+    // 无保存位置，按正常逻辑处理
+    const shouldFollowLatest =
+      shouldStickToBottomRef.current ||
+      getResultsDistanceFromBottom(element) <= SCROLL_TO_LATEST_THRESHOLD;
+
+    if (shouldFollowLatest) {
+      requestAnimationFrame(() => scrollResultsToLatest("smooth"));
+      return;
+    }
+
+    const btn = scrollToLatestBtnRef.current;
+    if (btn) btn.style.display = "";
+  }, [selectedConversation?.id, selectedConversation?.updatedAt, selectedConversation?.turns.length, scrollResultsToLatest]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    if (selectedConversationId) {
+      window.localStorage.setItem(ACTIVE_CONVERSATION_STORAGE_KEY, selectedConversationId);
+    } else {
+      window.localStorage.removeItem(ACTIVE_CONVERSATION_STORAGE_KEY);
+    }
+  }, [selectedConversationId]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    window.localStorage.setItem(IMAGE_RATIO_STORAGE_KEY, imageRatio);
+    window.localStorage.setItem(IMAGE_TIER_STORAGE_KEY, imageTier);
+    window.localStorage.setItem(IMAGE_QUALITY_STORAGE_KEY, imageQuality);
+    window.localStorage.setItem(IMAGE_MODEL_STORAGE_KEY, imageModel);
+  }, [imageRatio, imageTier, imageQuality, imageModel]);
+
+  useEffect(() => {
+    if (typeof window !== "undefined" && parsedCount > 0) {
+      window.localStorage.setItem(IMAGE_COUNT_STORAGE_KEY, String(parsedCount));
+    }
+  }, [parsedCount]);
+
+  useEffect(() => {
+    if (selectedConversationId && !conversations.some((conversation) => conversation.id === selectedConversationId)) {
+      setSelectedConversationId(pickFallbackConversationId(conversations));
+    }
+  }, [conversations, selectedConversationId]);
+
+  const persistConversation = async (conversation: ImageConversation) => {
+    const nextConversations = sortImageConversations([
+      conversation,
+      ...conversationsRef.current.filter((item) => item.id !== conversation.id),
+    ]);
+    conversationsRef.current = nextConversations;
+    setConversations(nextConversations);
+    await saveImageConversation(conversation);
+  };
+
+  const updateConversation = useCallback(
+    async (
+      conversationId: string,
+      updater: (current: ImageConversation | null) => ImageConversation,
+      // "when-changed"：仅当结果、错误、状态流转等需要持久化的内容变化时才写盘；
+      // 轮询里每个 tick 都会变的运行进度（progress / elapsedSecs 等）只更新内存，不落盘
+      options: { persist?: boolean | "when-changed" } = {},
+    ) => {
+      const current = conversationsRef.current.find((item) => item.id === conversationId) ?? null;
+      const nextConversation = updater(current);
+      const nextConversations = sortImageConversations([
+        nextConversation,
+        ...conversationsRef.current.filter((item) => item.id !== conversationId),
+      ]);
+      conversationsRef.current = nextConversations;
+      setConversations(nextConversations);
+      const shouldPersist =
+        options.persist === false
+          ? false
+          : options.persist === "when-changed"
+            ? hasPersistentConversationChanges(current, nextConversation)
+            : true;
+      if (shouldPersist) {
+        await saveImageConversation(nextConversation);
+      }
+    },
+    [],
+  );
+
+  const clearComposerInputs = useCallback(() => {
+    setImagePrompt("");
+    setReferenceImageFiles([]);
+    setReferenceImages([]);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }, []);
+
+  const resetComposer = useCallback(() => {
+    clearComposerInputs();
+  }, [clearComposerInputs]);
+
+  // 以下回调都会传给 memo 过的子组件：用 useCallback 保持引用稳定，输入框打字时子组件才不会跟着重渲染
+  const handleCreateDraft = useCallback(() => {
+    linkedTaskDismissedRef.current = true;
+    setLinkedServerTask(null);
+    setLinkedTaskMessage("");
+    shouldStickToBottomRef.current = true;
+    const btn = scrollToLatestBtnRef.current;
+    if (btn) btn.style.display = "none";
+    setSelectedConversationId(null);
+    resetComposer();
+    textareaRef.current?.focus();
+  }, [resetComposer]);
+
+  const handleDeleteConversation = async (id: string) => {
+    const nextConversations = conversations.filter((item) => item.id !== id);
+    conversationsRef.current = nextConversations;
+    setConversations(nextConversations);
+    if (selectedConversationId === id) {
+      setSelectedConversationId(pickFallbackConversationId(nextConversations));
+      resetComposer();
+    }
+
+    try {
+      await deleteImageConversation(id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "删除会话失败";
+      toast.error(message);
+      const items = await listImageConversations();
+      conversationsRef.current = items;
+      setConversations(items);
+    }
+  };
+
+  const handleDeleteTurnPart = async (conversationId: string, turnId: string, part: "prompt" | "results") => {
+    const conversation = conversationsRef.current.find((item) => item.id === conversationId);
+    if (!conversation) {
+      return;
+    }
+
+    const turns = conversation.turns
+      .map((turn) => {
+        if (turn.id !== turnId) {
+          return turn;
+        }
+        const images =
+          part === "results"
+            ? turn.images.map((image) => ({ id: image.id, status: "error" as const, error: "生成结果已删除" }))
+            : turn.images;
+        const derived =
+          part === "results"
+            ? deriveTurnStatus({
+                ...turn,
+                images,
+              })
+            : { status: turn.status, error: turn.error };
+        const nextTurn = {
+          ...turn,
+          prompt: part === "prompt" ? "" : turn.prompt,
+          promptDeleted: part === "prompt" ? true : turn.promptDeleted,
+          resultsDeleted: part === "results" ? true : turn.resultsDeleted,
+          ...derived,
+          images,
+        };
+        return nextTurn.promptDeleted && nextTurn.resultsDeleted ? null : nextTurn;
+      })
+      .filter((turn): turn is ImageTurn => Boolean(turn));
+
+    if (turns.length === 0) {
+      await handleDeleteConversation(conversationId);
+      return;
+    }
+
+    const nextConversation = {
+      ...conversation,
+      updatedAt: new Date().toISOString(),
+      turns,
+    };
+    await persistConversation(nextConversation);
+  };
+
+  const handleClearHistory = async () => {
+    try {
+      await clearImageConversations();
+      conversationsRef.current = [];
+      setConversations([]);
+      setSelectedConversationId(null);
+      resetComposer();
+      toast.success("已清空历史记录");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "清空历史记录失败";
+      toast.error(message);
+    }
+  };
+
+  const handleRenameConversation = useCallback(async (id: string, title: string) => {
+    const nextConversations = conversationsRef.current.map((item) =>
+      item.id === id ? { ...item, title, updatedAt: new Date().toISOString() } : item,
+    );
+    conversationsRef.current = sortImageConversations(nextConversations);
+    setConversations(conversationsRef.current);
+    try {
+      await renameImageConversation(id, title);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "重命名失败";
+      toast.error(message);
+    }
+  }, []);
+
+  const openDeleteConversationConfirm = useCallback((id: string) => {
+    setIsHistoryOpen(false);
+    setDeleteConfirm({ type: "one", id });
+  }, []);
+
+  const openDeletePromptConfirm = useCallback((conversationId: string, turnId: string) => {
+    setDeleteConfirm({ type: "prompt", conversationId, turnId });
+  }, []);
+
+  const openDeleteResultsConfirm = useCallback((conversationId: string, turnId: string) => {
+    setDeleteConfirm({ type: "results", conversationId, turnId });
+  }, []);
+
+  const openClearHistoryConfirm = useCallback(() => {
+    setIsHistoryOpen(false);
+    setDeleteConfirm({ type: "all" });
+  }, []);
+
+  const handleConfirmDelete = async () => {
+    const target = deleteConfirm;
+    setDeleteConfirm(null);
+    if (!target) {
+      return;
+    }
+    if (target.type === "all") {
+      await handleClearHistory();
+      return;
+    }
+    if (target.type === "prompt" || target.type === "results") {
+      await handleDeleteTurnPart(target.conversationId, target.turnId, target.type);
+      return;
+    }
+    await handleDeleteConversation(target.id);
+  };
+
+  const appendReferenceImages = useCallback(async (files: File[]) => {
+    if (files.length === 0) {
+      return;
+    }
+
+    try {
+      const previews = await Promise.all(
+        files.map(async (file) => ({
+          name: file.name,
+          type: file.type || "image/png",
+          dataUrl: await readFileAsDataUrl(file),
+        })),
+      );
+
+      setReferenceImageFiles((prev) => [...prev, ...files]);
+      setReferenceImages((prev) => [...prev, ...previews]);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "读取参考图失败";
+      toast.error(message);
+    }
+  }, []);
+
+  const handleReferenceImageChange = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0) {
+        return;
+      }
+
+      await appendReferenceImages(files);
+    },
+    [appendReferenceImages],
+  );
+
+  const handleRemoveReferenceImage = useCallback((index: number) => {
+    setReferenceImageFiles((prev) => {
+      const next = prev.filter((_, currentIndex) => currentIndex !== index);
+      if (next.length === 0 && fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+      return next;
+    });
+    setReferenceImages((prev) => prev.filter((_, currentIndex) => currentIndex !== index));
+  }, []);
+
+  const handleContinueEdit = useCallback(
+    async (conversationId: string, image: StoredImage | StoredReferenceImage) => {
+      try {
+        const nextReference =
+          "dataUrl" in image
+            ? {
+                referenceImage: image,
+                file: dataUrlToFile(image.dataUrl, image.name, image.type),
+              }
+            : await buildReferenceImageFromStoredImage(image, `conversation-${conversationId}-${Date.now()}.png`);
+        if (!nextReference) {
+          return;
+        }
+
+        setSelectedConversationId(conversationId);
+
+        setReferenceImages((prev) => [...prev, nextReference.referenceImage]);
+        setReferenceImageFiles((prev) => [...prev, nextReference.file]);
+        setImagePrompt("");
+        textareaRef.current?.focus();
+        toast.success("已加入当前参考图，继续输入描述即可编辑");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "读取结果图失败";
+        toast.error(message);
+      }
+    },
+    [],
+  );
+
+  const handleReuseTurnConfig = useCallback(async (conversationId: string, turnId: string) => {
+    const conversation = conversationsRef.current.find((item) => item.id === conversationId);
+    const turn = conversation?.turns.find((item) => item.id === turnId);
+    if (!conversation || !turn || !turn.prompt.trim()) {
+      return;
+    }
+
+    setSelectedConversationId(conversationId);
+    setImagePrompt(turn.prompt);
+    setImageCount(String(Math.max(1, turn.count || turn.images.length || 1)));
+    setImageRatio(turn.ratio);
+    setImageTier(turn.tier);
+    const parsedSize = parseImageSize(turn.size);
+    setImageWidth(parsedSize.width);
+    setImageHeight(parsedSize.height);
+    setImageQuality(turn.quality);
+    setImageModel(turn.model);
+    setReferenceImages(turn.referenceImages);
+    setReferenceImageFiles(
+      turn.referenceImages.map((image) => dataUrlToFile(image.dataUrl, image.name, image.type)),
+    );
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+    textareaRef.current?.focus();
+    toast.success("已复用这条提示词配置");
+  }, []);
+
+  const openLightbox = useCallback((images: ImageLightboxItem[], index: number) => {
+    if (images.length === 0) {
+      return;
+    }
+
+    setLightboxImages(images);
+    setLightboxIndex(Math.max(0, Math.min(index, images.length - 1)));
+    setLightboxOpen(true);
+  }, []);
+
+  const createLoadingImages = (turnId: string, count: number) =>
+    Array.from({ length: count }, (_, index) => {
+      const imageId = `${turnId}-${index}`;
+      pendingSubmissionTaskIdsRef.current.add(imageId);
+      return {
+        id: imageId,
+        taskId: imageId,
+        status: "loading" as const,
+      };
+    });
+
+  /* eslint-disable react-hooks/preserve-manual-memoization */
+  const runConversationQueue = useCallback(
+    async (conversationId: string) => {
+      if (activeConversationQueueIds.has(conversationId) || resumingConversationIdsRef.current.has(conversationId)) {
+        return;
+      }
+
+      const snapshot = conversationsRef.current.find((conversation) => conversation.id === conversationId);
+      const activeTurn = snapshot?.turns.find(
+        (turn) =>
+          (turn.status === "queued" || turn.status === "generating") &&
+          turn.images.some((image) => image.status === "loading"),
+      );
+      if (!snapshot || !activeTurn) {
+        return;
+      }
+
+      activeConversationQueueIds.add(conversationId);
+      const applyTasks = async (tasks: ImageTask[]) => {
+        const taskMap = new Map(tasks.map((task) => [task.id, task]));
+        await updateConversation(conversationId, (current) => {
+          const conversation = current ?? snapshot;
+          const turns = conversation.turns.map((turn) => {
+            if (turn.id !== activeTurn.id) {
+              return turn;
+            }
+            const images = turn.images.map((image) => {
+              const taskId = image.taskId || image.id;
+              const task = taskMap.get(taskId);
+              return task ? taskDataToStoredImage({ ...image, taskId }, task) : image;
+            });
+            const derived = deriveTurnStatus({ ...turn, images });
+            return {
+              ...turn,
+              ...derived,
+              images,
+            };
+          });
+          return {
+            ...conversation,
+            updatedAt: new Date().toISOString(),
+            turns,
+          };
+        }, { persist: "when-changed" });
+      };
+
+      try {
+        const pendingImages = activeTurn.images.filter((image) => image.status === "loading");
+        const newImages = pendingImages.filter((image) => pendingSubmissionTaskIdsRef.current.has(image.taskId || image.id));
+        const knownImages = pendingImages.filter((image) => !pendingSubmissionTaskIdsRef.current.has(image.taskId || image.id));
+        const referenceFiles = newImages.length === 0 ? [] : activeTurn.referenceImages.map((image, index) =>
+          dataUrlToFile(image.dataUrl, image.name || `${activeTurn.id}-${index + 1}.png`, image.type),
+        );
+        if (newImages.length > 0 && activeTurn.mode === "edit" && referenceFiles.length === 0) {
+          throw new Error("未找到可用于继续编辑的参考图");
+        }
+
+        // 已经存在的任务只读查询。记录丢失或请求结果未知，都不构成再次生成的授权。
+        const existing = knownImages.length > 0 ? await fetchImageTasks(knownImages.map((image) => image.taskId || image.id)).catch(() => {
+          throw new Error("任务状态无法确认，请刷新页面重新查询；也可手动重新生成新任务。");
+        }) : null;
+        const recovered = existing ? knownImages.map((image): ImageTask => existing.items.find((task) => task.id === (image.taskId || image.id)) || {
+          id: image.taskId || image.id, status: "error", mode: activeTurn.mode, created_at: activeTurn.createdAt, updated_at: new Date().toISOString(), error: "任务状态无法确认，记录不存在或已过期；请刷新状态或手动重新生成新任务。",
+        }) : [];
+        const submitted = await Promise.all(
+          newImages.map((image) => {
+            const taskId = image.taskId || image.id;
+            // 发请求前消费首次提交资格：即使响应丢失，也不能隐式重放 POST。
+            pendingSubmissionTaskIdsRef.current.delete(taskId);
+            return activeTurn.mode === "edit"
+              ? createImageEditTask(taskId, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality)
+              : createImageGenerationTask(taskId, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality);
+          }),
+        );
+        await applyTasks([...recovered, ...submitted]);
+        notifyTaskUpdate();
+
+        let consecutiveErrors = 0;
+        const retryingTaskIdsRef = new Set<string>();
+        while (true) {
+          const latestConversation = conversationsRef.current.find((conversation) => conversation.id === conversationId);
+          const latestTurn = latestConversation?.turns.find((turn) => turn.id === activeTurn.id);
+          const loadingTaskIds =
+            latestTurn?.images.flatMap((image) =>
+              image.status === "loading" && image.taskId ? [image.taskId] : [],
+            ) || [];
+          if (loadingTaskIds.length === 0) {
+            break;
+          }
+
+          await sleep(pollDelayMs());
+          try {
+            const taskList = await fetchImageTasks(loadingTaskIds);
+            consecutiveErrors = 0;
+            if (taskList.items.length > 0) {
+              // 检测是否有超时错误且需要显示重试按钮
+              const timeoutTask = taskList.items.find(
+                (task) =>
+                  task.status === "error" &&
+                  task.error?.includes("超时") &&
+                  task.conversation_id &&
+                  !retryingTaskIdsRef.has(task.id),
+              );
+              if (timeoutTask && timeoutTask.conversation_id) {
+                retryingTaskIdsRef.add(timeoutTask.id);
+                setTimeoutRetry({
+                  conversationId,
+                  taskId: timeoutTask.id,
+                  taskError: timeoutTask.error || "生图超时",
+                });
+                // 应用超时错误到对应图片，显示继续等待按钮
+                await applyTasks([timeoutTask]);
+              } else {
+                await applyTasks(taskList.items);
+              }
+            }
+            if (taskList.missing_ids.length > 0 && latestTurn) {
+              await applyTasks(taskList.missing_ids.map((id): ImageTask => ({ id, status: "error", mode: activeTurn.mode, created_at: activeTurn.createdAt, updated_at: new Date().toISOString(), error: "任务记录不存在或已过期，已保留原任务 ID；请手动重新生成新任务。" })));
+            }
+          } catch (pollError) {
+            consecutiveErrors += 1;
+            if (consecutiveErrors >= 10) {
+              throw new Error("任务状态无法确认，请刷新页面重新查询；也可手动重新生成新任务。");
+            }
+          }
+        }
+
+        await loadQuota();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "生成图片失败";
+        await updateConversation(conversationId, (current) => {
+          const conversation = current ?? snapshot;
+          return {
+            ...conversation,
+            updatedAt: new Date().toISOString(),
+            turns: conversation.turns.map((turn) =>
+              turn.id === activeTurn.id
+                ? {
+                    ...turn,
+                    status: "error",
+                    error: message,
+                    images: turn.images.map((image) =>
+                      image.status === "loading" ? { ...image, status: "error", error: message } : image,
+                    ),
+                  }
+                : turn,
+            ),
+          };
+        });
+        toast.error(message);
+      } finally {
+        notifyTaskUpdate();
+        activeConversationQueueIds.delete(conversationId);
+        for (const conversation of conversationsRef.current) {
+          if (
+            !activeConversationQueueIds.has(conversation.id) &&
+            !resumingConversationIdsRef.current.has(conversation.id) &&
+            conversation.turns.some(
+              (turn) =>
+                (turn.status === "queued" || turn.status === "generating") &&
+                turn.images.some((image) => image.status === "loading"),
+            )
+          ) {
+            void runConversationQueue(conversation.id);
+          }
+        }
+      }
+    },
+    [loadQuota, updateConversation],
+  );
+  /* eslint-enable react-hooks/preserve-manual-memoization */
+
+  const handleRegenerateTurn = useCallback(
+    async (conversationId: string, turnId: string) => {
+      const conversation = conversationsRef.current.find((item) => item.id === conversationId);
+      const sourceTurn = conversation?.turns.find((turn) => turn.id === turnId);
+      if (!conversation || !sourceTurn || !sourceTurn.prompt.trim()) {
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const nextTurnId = createId();
+      const count = Math.max(1, sourceTurn.count || sourceTurn.images.length || 1);
+      const nextTurn: ImageTurn = {
+        id: nextTurnId,
+        prompt: sourceTurn.prompt,
+        model: sourceTurn.model,
+        mode: sourceTurn.mode,
+        referenceImages: sourceTurn.referenceImages,
+        count,
+        size: sourceTurn.size,
+        ratio: sourceTurn.ratio,
+        tier: sourceTurn.tier,
+        quality: sourceTurn.quality,
+        images: createLoadingImages(nextTurnId, count),
+        createdAt: now,
+        status: "queued",
+      };
+      const nextConversation = {
+        ...conversation,
+        updatedAt: now,
+        turns: [...conversation.turns, nextTurn],
+      };
+
+      setSelectedConversationId(conversationId);
+      await persistConversation(nextConversation);
+      void runConversationQueue(conversationId);
+      toast.success("已加入重新生成队列");
+    },
+    [runConversationQueue],
+  );
+
+  const handleRetryImage = useCallback(
+    async (conversationId: string, turnId: string, imageId: string) => {
+      const conversation = conversationsRef.current.find((item) => item.id === conversationId);
+      if (!conversation) {
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const retryImageId = `${turnId}-${createId()}`;
+      pendingSubmissionTaskIdsRef.current.add(retryImageId);
+      const nextConversation = {
+        ...conversation,
+        updatedAt: now,
+        turns: conversation.turns.map((turn) => {
+          if (turn.id !== turnId) {
+            return turn;
+          }
+          if (!turn.prompt.trim()) {
+            return turn;
+          }
+
+          const images = turn.images.map((image) =>
+            image.id === imageId
+              ? {
+                  id: retryImageId,
+                  taskId: retryImageId,
+                  status: "loading" as const,
+                }
+              : image,
+          );
+          const derived = deriveTurnStatus({ ...turn, status: "queued", images });
+          return {
+            ...turn,
+            ...derived,
+            images,
+          };
+        }),
+      };
+
+      setSelectedConversationId(conversationId);
+      await persistConversation(nextConversation);
+      void runConversationQueue(conversationId);
+    },
+    [runConversationQueue],
+  );
+
+  const handleTimeoutRetryContinue = useCallback(async (requestedTaskId?: string) => {
+    const localConversation = requestedTaskId ? conversationsRef.current.find((conversation) => conversation.turns.some((turn) => turn.images.some((image) => image.taskId === requestedTaskId))) : undefined;
+    // 历史图片在刷新后仍能继续等待；恢复目标始终以被点击的图片为准。
+    const recovery = localConversation && requestedTaskId ? { conversationId: localConversation.id, taskId: requestedTaskId } : timeoutRetry;
+    if (!recovery) return;
+    const { conversationId, taskId } = recovery;
+    if (resumingTaskIdsRef.current.has(taskId)) return;
+    resumingTaskIdsRef.current.add(taskId);
+    resumingConversationIdsRef.current.add(conversationId);
+    const applyTask = async (task: ImageTask) => {
+      await updateConversation(conversationId, (current) => {
+        const conversation = current ?? conversationsRef.current.find((item) => item.id === conversationId);
+        if (!conversation) return current!;
+        return {
+          ...conversation,
+          updatedAt: new Date().toISOString(),
+          turns: conversation.turns.map((turn) => {
+            if (!turn.images.some((image) => image.taskId === taskId)) return turn;
+            const images = turn.images.map((image) => image.taskId === taskId ? taskDataToStoredImage(image, task) : image);
+            return { ...turn, ...deriveTurnStatus({ ...turn, images }), images };
+          }),
+        };
+      }, { persist: "when-changed" });
+    };
+    try {
+      const resumed = await resumeImagePoll(taskId, imageTimeoutRetrySecs);
+      await applyTask(resumed);
+      setTimeoutRetry(null);
+      notifyTaskUpdate();
+      toast.info(`已继续等待 ${imageTimeoutRetrySecs} 秒`);
+      let failures = 0;
+      // 继续等待只读取已存在的任务；不能进入会重新 POST 生成的普通队列。
+      while (!loadCancelledRef.current) {
+        await sleep(pollDelayMs());
+        if (loadCancelledRef.current) break;
+        let result: Awaited<ReturnType<typeof fetchImageTasks>>;
+        try {
+          result = await fetchImageTasks([taskId]);
+          failures = 0;
+        } catch (error) {
+          failures += 1;
+          if (failures >= 10) throw error;
+          continue;
+        }
+        const task = result.items.find((item) => item.id === taskId);
+        if (!task) {
+          if (result.missing_ids.includes(taskId)) throw new Error("原任务已不存在，无法继续等待");
+          continue;
+        }
+        await applyTask(task);
+        if (task.status === "success" || task.status === "error") {
+          if (task.status === "error" && task.conversation_id && task.error?.includes("超时")) {
+            setTimeoutRetry({ conversationId, taskId, taskError: task.error });
+          }
+          await loadQuota();
+          break;
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "续轮询失败";
+      if (!loadCancelledRef.current) await applyTask({ id: taskId, status: "error", error: msg } as ImageTask);
+      toast.error(msg);
+      setTimeoutRetry(null);
+    } finally {
+      resumingTaskIdsRef.current.delete(taskId);
+      resumingConversationIdsRef.current.delete(conversationId);
+      notifyTaskUpdate();
+      const conversation = conversationsRef.current.find((item) => item.id === conversationId);
+      if (!loadCancelledRef.current && conversation?.turns.some((turn) => turn.status === "queued" && turn.images.some((image) => image.status === "loading"))) {
+        void runConversationQueue(conversationId);
+      }
+    }
+  }, [timeoutRetry, updateConversation, imageTimeoutRetrySecs, loadQuota, runConversationQueue]);
+
+  const handleTimeoutRetryCancel = useCallback(() => {
+    if (!timeoutRetry) return;
+    const { conversationId: convId, taskId, taskError } = timeoutRetry;
+    // 将超时错误应用到对应图片
+    void updateConversation(convId, (current) => {
+      const conversation = current ?? conversationsRef.current.find((c) => c.id === convId);
+      if (!conversation) return current!;
+      return {
+        ...conversation,
+        updatedAt: new Date().toISOString(),
+        turns: conversation.turns.map((turn) => {
+          const hasLoading = turn.images.some((image) => image.status === "loading" && image.taskId === taskId);
+          if (!hasLoading) return turn;
+          const images = turn.images.map((image) =>
+            image.taskId === taskId ? { ...image, status: "error" as const, error: taskError } : image,
+          );
+          const derived = deriveTurnStatus({ ...turn, images });
+          return {
+            ...turn,
+            ...derived,
+            images,
+          };
+        }),
+      };
+    });
+    setTimeoutRetry(null);
+    toast.error(taskError);
+  }, [timeoutRetry, updateConversation]);
+
+  const handleDismissErrors = useCallback(
+    async (conversationId: string, turnId: string) => {
+      await updateConversation(conversationId, (current) => {
+        const conversation = current ?? conversationsRef.current.find((c) => c.id === conversationId);
+        if (!conversation) return current!;
+        return {
+          ...conversation,
+          updatedAt: new Date().toISOString(),
+          turns: conversation.turns.map((turn) => {
+            if (turn.id !== turnId) return turn;
+            const successImages = turn.images.filter((image) => image.status !== "error");
+            const derived = deriveTurnStatus({ ...turn, images: successImages });
+            return {
+              ...turn,
+              ...derived,
+              count: successImages.length,
+              images: successImages,
+            };
+          }),
+        };
+      });
+    },
+    [updateConversation],
+  );
+
+  useEffect(() => {
+    for (const conversation of conversations) {
+      if (
+        !activeConversationQueueIds.has(conversation.id) &&
+        !resumingConversationIdsRef.current.has(conversation.id) &&
+        conversation.turns.some(
+          (turn) =>
+            !turn.resultsDeleted &&
+            (turn.status === "queued" || turn.status === "generating") &&
+            turn.images.some((image) => image.status === "loading"),
+        )
+      ) {
+        void runConversationQueue(conversation.id);
+      }
+    }
+  }, [conversations, runConversationQueue]);
+
+  const handleSubmit = async () => {
+    const prompt = imagePrompt.trim();
+    if (!prompt) {
+      toast.error("请输入提示词");
+      return;
+    }
+    linkedTaskDismissedRef.current = true;
+    setLinkedServerTask(null);
+    setLinkedTaskMessage("");
+
+    const effectiveImageMode: ImageConversationMode = referenceImageFiles.length > 0 ? "edit" : "generate";
+
+    const targetConversation = selectedConversationId
+      ? conversationsRef.current.find((conversation) => conversation.id === selectedConversationId) ?? null
+      : null;
+    const now = new Date().toISOString();
+    const conversationId = targetConversation?.id ?? createId();
+    const turnId = createId();
+    const imageSize = `${imageWidth || 1024}x${imageHeight || 1024}`;
+    const draftTurn: ImageTurn = {
+      id: turnId,
+      prompt,
+      model: imageModel,
+      mode: effectiveImageMode,
+      referenceImages: effectiveImageMode === "edit" ? referenceImages : [],
+      count: parsedCount,
+      size: imageSize,
+      ratio: imageRatio,
+      tier: imageTier,
+      quality: imageQuality,
+      images: createLoadingImages(turnId, parsedCount),
+      createdAt: now,
+      status: "queued",
+    };
+
+    const baseConversation: ImageConversation = targetConversation
+      ? {
+          ...targetConversation,
+          updatedAt: now,
+          turns: [...targetConversation.turns, draftTurn],
+        }
+      : {
+          id: conversationId,
+          title: buildConversationTitle(prompt),
+          createdAt: now,
+          updatedAt: now,
+          turns: [draftTurn],
+      };
+
+    shouldStickToBottomRef.current = true;
+    const btn = scrollToLatestBtnRef.current;
+    if (btn) btn.style.display = "none";
+    setSelectedConversationId(conversationId);
+    clearComposerInputs();
+
+    await persistConversation(baseConversation);
+    void runConversationQueue(conversationId);
+
+    const targetStats = getImageConversationStats(baseConversation);
+    if (targetStats.running > 0 || targetStats.queued > 1) {
+      toast.success("已加入当前对话队列");
+    } else if (!targetConversation) {
+      toast.success("已创建新对话并开始处理");
+    } else {
+      toast.success("已发送到当前对话");
+    }
+  };
+
+  // handleSubmit 依赖一堆输入状态，每次渲染都是新函数；通过 ref 取最新版本，对外暴露引用稳定的回调，
+  // 这样输入区之外的状态变化（轮询、切换会话）不会让 ImageComposer 白白重渲染
+  const handleSubmitRef = useRef(handleSubmit);
+  useEffect(() => {
+    handleSubmitRef.current = handleSubmit;
+  });
+  const submitFromComposer = useCallback(() => handleSubmitRef.current(), []);
+  const handleImageCountChange = useCallback(
+    (value: string) => setImageCount(value ? clampImageCount(value) : ""),
+    [],
+  );
+  const handlePickReferenceImage = useCallback(() => fileInputRef.current?.click(), []);
+
+  return (
+    <div className="flex h-full min-h-0 w-full flex-1 flex-col gap-4" data-workspace="image">
+      <PageHeader
+        eyebrow="Creative Studio"
+        title="生图"
+        description="把灵感变成画面，从一句描述开始。"
+        actions={<span className="inline-flex items-center gap-2 rounded-full border border-border bg-card/60 px-3 py-2 text-xs text-muted-foreground" role="status"><Sparkles className="size-3.5 text-primary" />{activeTaskCount > 0 ? `${activeTaskCount} 个任务处理中` : "创作空间已就绪"}</span>}
+      />
+      {linkedTaskMessage ? <p role="status" className="rounded-xl border border-border bg-field px-4 py-3 text-sm text-muted-foreground">{linkedTaskMessage}</p> : null}
+      <section className="mx-auto grid min-h-0 w-full flex-1 grid-cols-1 gap-2 overflow-hidden px-0 pb-[calc(env(safe-area-inset-bottom)+0.5rem)] sm:gap-3 sm:pb-0 lg:grid-cols-[240px_minmax(0,1fr)]">
+        <div className="hidden h-full min-h-0 lg:block">
+          <div className="surface h-full min-h-0 rounded-2xl p-3">
+            <ImageSidebar
+              conversations={conversations}
+              isLoadingHistory={isLoadingHistory}
+              selectedConversationId={selectedConversationId}
+              onCreateDraft={handleCreateDraft}
+              onClearHistory={openClearHistoryConfirm}
+              onSelectConversation={selectLocalConversation}
+              onDeleteConversation={openDeleteConversationConfirm}
+              onRenameConversation={handleRenameConversation}
+              formatConversationTime={formatConversationTime}
+            />
+          </div>
+        </div>
+
+        <Dialog open={isHistoryOpen} onOpenChange={setIsHistoryOpen}>
+          <DialogContent className="flex h-[min(82dvh,760px)] w-[92vw] max-w-[460px] flex-col overflow-hidden">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <History className="size-5" />
+                历史记录
+              </DialogTitle>
+            </DialogHeader>
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              <ImageSidebar
+                conversations={conversations}
+                isLoadingHistory={isLoadingHistory}
+                selectedConversationId={selectedConversationId}
+                onCreateDraft={() => {
+                  handleCreateDraft();
+                  setIsHistoryOpen(false);
+                }}
+                onClearHistory={openClearHistoryConfirm}
+                onSelectConversation={(id) => {
+                  selectLocalConversation(id);
+                  setIsHistoryOpen(false);
+                }}
+                onDeleteConversation={openDeleteConversationConfirm}
+                onRenameConversation={handleRenameConversation}
+                formatConversationTime={formatConversationTime}
+                hideActionButtons
+              />
+            </div>
+          </DialogContent>
+        </Dialog>
+
+        <div className="flex min-h-0 flex-col gap-2 sm:gap-4">
+          <div className="flex items-center gap-2 px-1 lg:hidden">
+            <Button
+              variant="outline"
+              className="flex-1 justify-start"
+              onClick={() => setIsHistoryOpen(true)}
+            >
+              <History className="size-4" />
+              历史记录 ({conversations.length})
+            </Button>
+            <Button onClick={handleCreateDraft}>
+              <Plus className="size-4" />
+              新建
+            </Button>
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={openClearHistoryConfirm}
+              disabled={conversations.length === 0}
+              aria-label="清空历史记录"
+            >
+              <Trash2 className="size-4" />
+            </Button>
+          </div>
+
+          <div className="relative min-h-0 flex-1">
+            <div
+              ref={resultsViewportRef}
+              onScroll={handleResultsScroll}
+              className="hide-scrollbar h-full overscroll-contain overflow-y-auto px-1 py-2 sm:px-4 sm:py-4"
+              style={{ contain: "layout style paint" }}
+            >
+              {linkedServerTask ? (
+                <Card className="mx-auto max-w-4xl gap-4 p-5" data-linked-image-task={linkedServerTask.id}>
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div><h2 className="text-lg font-semibold">图片生成任务</h2><p className="mt-1 break-all font-mono text-xs text-muted-foreground">{linkedServerTask.id}</p></div>
+                    <span role="status" className="inline-flex items-center gap-2 rounded-full bg-field px-3 py-2 text-xs">{["queued", "running"].includes(linkedServerTask.status) ? <LoaderCircle className="size-3.5 animate-spin" /> : null}{{ queued: "排队中", running: "生成中", success: "已完成", error: "未完成" }[linkedServerTask.status]}</span>
+                  </div>
+                  <p className="text-sm text-muted-foreground">此任务来自服务端记录，当前浏览器没有对应的本地会话。</p>
+                  {linkedServerTask.error ? <p role="alert" className="rounded-xl bg-destructive/10 p-3 text-sm text-destructive">{linkedServerTask.error}</p> : null}
+                  {linkedServerTask.data?.length ? <div className="grid gap-4 sm:grid-cols-2">{linkedServerTask.data.map((item, index) => {
+                    const src = item.url || (item.b64_json ? `data:image/png;base64,${item.b64_json}` : "");
+                    if (!src) return null;
+                    return <button key={index} type="button" aria-label={`预览任务图片 ${index + 1}`} className="overflow-hidden rounded-2xl border border-border bg-muted" onClick={() => openLightbox([{ id: `${linkedServerTask.id}-${index}`, src }], 0)}><img src={src} alt={`任务结果 ${index + 1}`} className="h-auto w-full object-contain" /></button>;
+                  })}</div> : null}
+                </Card>
+              ) : <ImageResults
+                selectedConversation={selectedConversation}
+                onOpenLightbox={openLightbox}
+                onContinueEdit={handleContinueEdit}
+                onDeletePrompt={openDeletePromptConfirm}
+                onDeleteResults={openDeleteResultsConfirm}
+                onReuseTurnConfig={handleReuseTurnConfig}
+                onRegenerateTurn={handleRegenerateTurn}
+                onRetryImage={handleRetryImage}
+                onTimeoutRetryContinue={handleTimeoutRetryContinue}
+                onDismissErrors={handleDismissErrors}
+                formatConversationTime={formatConversationTime}
+              />}
+            </div>
+
+            <button
+              ref={scrollToLatestBtnRef}
+              type="button"
+              aria-label="滚动到最新消息"
+              title="滚动到最新消息"
+              onClick={() => scrollResultsToLatest("smooth")}
+              className="absolute bottom-4 left-1/2 z-20 inline-flex size-11 -translate-x-1/2 items-center justify-center rounded-full border border-border bg-popover text-foreground shadow-md transition-[background-color,transform] hover:-translate-y-0.5 hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+              style={{ display: "none" }}
+            >
+              <ArrowDown className="size-5" />
+            </button>
+          </div>
+
+          <ImageComposer
+            prompt={imagePrompt}
+            imageCount={imageCount}
+            imageRatio={imageRatio}
+            imageTier={imageTier}
+            imageWidth={imageWidth}
+            imageHeight={imageHeight}
+            imageQuality={imageQuality}
+            imageModel={imageModel}
+            imageModels={imageModels}
+            availableQuota={availableQuota}
+            activeTaskCount={activeTaskCount}
+            referenceImages={referenceImages}
+            textareaRef={textareaRef}
+            fileInputRef={fileInputRef}
+            onPromptChange={setImagePrompt}
+            onImageCountChange={handleImageCountChange}
+            onImageRatioChange={setImageRatio}
+            onImageTierChange={setImageTier}
+            onImageWidthChange={setImageWidth}
+            onImageHeightChange={setImageHeight}
+            onImageQualityChange={setImageQuality}
+            onImageModelChange={handleImageModelChange}
+            onSubmit={submitFromComposer}
+            onPickReferenceImage={handlePickReferenceImage}
+            onReferenceImageChange={handleReferenceImageChange}
+            onRemoveReferenceImage={handleRemoveReferenceImage}
+          />
+        </div>
+      </section>
+
+      <ImageLightbox
+        images={lightboxImages}
+        currentIndex={lightboxIndex}
+        open={lightboxOpen}
+        onOpenChange={setLightboxOpen}
+        onIndexChange={setLightboxIndex}
+      />
+
+      {deleteConfirm ? (
+        <Dialog open onOpenChange={(open) => (!open ? setDeleteConfirm(null) : null)}>
+          <DialogContent showCloseButton={false}>
+            <DialogHeader className="gap-2">
+              <DialogTitle>{deleteConfirmTitle}</DialogTitle>
+              <DialogDescription className="text-sm leading-6">
+                {deleteConfirmDescription}
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button variant="secondary" onClick={() => setDeleteConfirm(null)}>
+                取消
+              </Button>
+              <Button variant="destructive" onClick={() => void handleConfirmDelete()}>
+                确认删除
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      ) : null}
+
+
+    </div>
+  );
+}
+
+function AuthenticatedImagePage() {
+  const { isCheckingAuth, session } = useAuthGuard();
+
+  if (isCheckingAuth || !session) {
+    return <PageLoader />;
+  }
+
+  return <ImagePageContent isAdmin={session.role === "admin"} />;
+}
+
+export default function ImagePage() {
+  return <Suspense fallback={<PageLoader />}><AuthenticatedImagePage /></Suspense>;
+}

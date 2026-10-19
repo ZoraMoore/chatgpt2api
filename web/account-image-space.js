@@ -1,9 +1,12 @@
 (() => {
   'use strict';
-  // 页面样式独立加载；所有路由共用此入口，支持 Next 客户端导航。
-  import('/account-pool-layout.js?v=20261019-1').catch(() => {});
   if (window.__accountOperationsMounted) return;
   window.__accountOperationsMounted = true;
+  if (document.body.hasAttribute('data-global-glass')) {
+    const stylesheet = document.createElement('link');
+    stylesheet.rel = 'stylesheet'; stylesheet.href = '/global-glass-compat.css?v=20261020';
+    document.head.append(stylesheet);
+  }
   const prefix = 'chatgpt2api:account-operations:';
   const state = { items: [], selected: [], busy: false, loaded: false };
   let cleanup, cleanupPromise, restored = false, deepLinkHandled = false;
@@ -101,6 +104,7 @@
     node.disabled = disabled; node.dataset.unavailable = String(disabled); node.onclick = handler; return node;
   }
   async function preferences(fields) {
+    if (selectedRefs.length > 20) { message('该操作单次最多处理 20 个账号，请减少选择后重试。'); return; }
     if (fields.image_cleanup_enabled === true && !window.confirm('对所选账号开启每天自动清理：仅将 7 天前的图片移入最近删除，首次执行在 24 小时后。是否开启？')) return;
     busy(true);
     try {
@@ -113,9 +117,11 @@
     finally { busy(false); }
   }
   async function refresh() {
+    if (selectedRefs.length > 20) { message('手动刷新单次最多处理 20 个账号，请减少选择后重试。'); return; }
     busy(true); message('正在通过 Refresh Token 刷新所选账号，请稍候…');
     try {
       const job = await api('/refresh', {account_ids:selectedRefs});
+      window.dispatchEvent(new CustomEvent('chatgpt2api:job-created', {detail:{kind:'account-refresh',id:job.id}}));
       const deadline = Date.now() + 20 * 60 * 1000;
       let result;
       do {
@@ -213,7 +219,7 @@
       }
     }
     const heading = Array.from(document.querySelectorAll('h1')).find(el => el.textContent === '号池管理');
-    const toolbar = heading?.parentElement?.parentElement?.lastElementChild;
+    const toolbar = document.getElementById('account-page-actions') || heading?.parentElement?.parentElement?.lastElementChild;
     if (toolbar && !document.getElementById('account-batch-operations')) {
       const entry = button('批量操作', () => open(state.selected)); entry.id = 'account-batch-operations'; toolbar.append(entry);
     }

@@ -1,5 +1,7 @@
 (() => {
   'use strict';
+  // 新前端使用原生受控设置；旧扩展仅兼容历史静态页面。
+  if (document.body.hasAttribute('data-global-glass')) return;
 
   if (window.__chatgpt2apiImageTransportSettingsInitialized) return;
   window.__chatgpt2apiImageTransportSettingsInitialized = true;

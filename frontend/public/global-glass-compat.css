@@ -1,0 +1,12 @@
+/* 兼容保留的账号操作/图像空间弹窗，使其与全站手动主题一致。 */
+body[data-global-glass] .account-op-dialog {
+  background:var(--card,#fff);color:var(--foreground,#172237);border:1px solid var(--border,#e2e9f4);
+  border-radius:22px;box-shadow:var(--overlay-shadow,0 20px 60px #182c4b26);
+}
+body[data-global-glass] .account-op-dialog::backdrop {background:#0d192966;}
+body[data-global-glass] :is(.account-op-summary,.cleanup-table-wrap) {background:var(--card,#fff);border-color:var(--border,#e2e9f4);}
+body[data-global-glass] .account-op-button {background:var(--field,#fff);border-color:var(--border,#e2e9f4);color:var(--foreground,#172237);border-radius:10px;}
+body[data-global-glass] .account-op-button:hover:not(:disabled) {background:var(--glass-tint,#edf4ff);color:var(--primary,#3478f6);}
+body[data-global-glass] :is(.account-op-status,.account-op-summary>div,.cleanup-table th,.cleanup-table td) {color:var(--muted-foreground,#6a7890);border-color:var(--border,#e2e9f4);}
+body[data-global-glass] .account-op-close {color:var(--muted-foreground,#6a7890);background:transparent;}
+body[data-global-glass] .account-op-dialog input {accent-color:var(--primary,#3478f6);}

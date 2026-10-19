@@ -104,6 +104,7 @@ export function createCleanupController({dialog, request, onChange}) {
       const result = await request('/preview', all ? {all_accounts:true} : {account_ids:state.refs});
       if (!result || !/^[a-f0-9]{32}$/.test(result.id)) throw new Error('服务没有返回有效任务编号，请稍后重新预览');
       state.id = result.id; persist();
+      window.dispatchEvent(new CustomEvent('chatgpt2api:job-created', {detail:{kind:'account-cleanup',id:result.id}}));
     } catch (error) { state.error = error.message; }
     finally { state.starting = false; render(); }
     if (state.id) await poll();

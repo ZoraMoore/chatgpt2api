@@ -1,0 +1,280 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", SFMono-Regular, Menlo, Consolas, monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+  --color-violet: var(--violet);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-field: var(--field);
+  --color-field-hover: var(--field-hover);
+  --color-segment: var(--segment);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-chart-grid: var(--chart-grid);
+
+  /* 控制台风格：比 Apple 风格收一档，卡片 16px、外壳 20px */
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.625rem;
+  --radius-xl: 0.75rem;
+  --radius-2xl: 1rem;
+  --radius-3xl: 1.25rem;
+  --radius-4xl: 1.5rem;
+}
+
+/* ------------------------------------------------------------------ */
+/* 浅色：Apple 中性灰底（#f5f5f7）+ 纯白卡片，强调色用系统色             */
+/* 绿 / 橙 / 青 / 紫会当文字用，取 Apple「增强对比度」那一档，白底上可读  */
+/* ------------------------------------------------------------------ */
+:root {
+  color-scheme: light;
+
+  --background: #f5f5f7;
+  --foreground: #1d1d1f;
+  --card: #ffffff;
+  --card-foreground: #1d1d1f;
+  --popover: #ffffff;
+  --popover-foreground: #1d1d1f;
+  --primary: #007aff;
+  --primary-foreground: #ffffff;
+  --secondary: rgb(118 118 128 / 0.12);
+  --secondary-foreground: #1d1d1f;
+  --muted: rgb(118 118 128 / 0.08);
+  --muted-foreground: #6e6e73;
+  --accent: rgb(118 118 128 / 0.1);
+  --accent-foreground: #1d1d1f;
+  --destructive: #ff3b30;
+  --success: #248a3d;
+  --warning: #c93400;
+  --info: #0071a4;
+  --violet: #8944ab;
+  --border: rgb(60 60 67 / 0.12);
+  --border-strong: rgb(60 60 67 / 0.22);
+  --input: rgb(60 60 67 / 0.18);
+  --ring: rgb(0 122 255 / 0.4);
+  --field: #ffffff;
+  --field-hover: #fafafa;
+  --segment: #ffffff;
+  --chart-grid: rgb(60 60 67 / 0.08);
+
+  --sidebar: #ffffff;
+  --sidebar-foreground: #1d1d1f;
+  --sidebar-border: rgb(60 60 67 / 0.1);
+
+  --surface-shadow: 0 1px 2px rgb(0 0 0 / 0.04);
+  --raised-bg: #ffffff;
+  --raised-shadow: 0 1px 2px rgb(0 0 0 / 0.04), 0 24px 56px -32px rgb(0 0 0 / 0.22);
+  --chrome-bg: rgb(255 255 255 / 0.8);
+  --chrome-shadow: 0 1px 2px rgb(0 0 0 / 0.04), 0 12px 32px -24px rgb(0 0 0 / 0.16);
+  --overlay-shadow: 0 24px 64px -24px rgb(0 0 0 / 0.28);
+  --scrollbar-thumb: rgb(60 60 67 / 0.24);
+
+  /* apple.com 的做法：顶部 #fbfbfd 往下过渡到 #f5f5f7，没有任何色相 */
+  --page-bg: linear-gradient(180deg, #fbfbfd 0, #f5f5f7 480px) #f5f5f7;
+}
+
+/* ------------------------------------------------------------------ */
+/* 深色：Apple 中性深灰（#161617 页面 / #1c1c1e 卡片 / #2c2c2e 弹层），  */
+/* 不带蓝色调，只有数据和系统蓝是亮的                                   */
+/* ------------------------------------------------------------------ */
+.dark {
+  color-scheme: dark;
+
+  --background: #161617;
+  --foreground: #f5f5f7;
+  --card: #1c1c1e;
+  --card-foreground: #f5f5f7;
+  --popover: #2c2c2e;
+  --popover-foreground: #f5f5f7;
+  --primary: #0a84ff;
+  --primary-foreground: #ffffff;
+  --secondary: rgb(118 118 128 / 0.24);
+  --secondary-foreground: #f5f5f7;
+  --muted: rgb(118 118 128 / 0.16);
+  --muted-foreground: #98989d;
+  --accent: rgb(255 255 255 / 0.06);
+  --accent-foreground: #f5f5f7;
+  --destructive: #ff453a;
+  --success: #30d158;
+  --warning: #ff9f0a;
+  --info: #64d2ff;
+  --violet: #bf5af2;
+  --border: rgb(255 255 255 / 0.08);
+  --border-strong: rgb(255 255 255 / 0.16);
+  --input: rgb(255 255 255 / 0.12);
+  --ring: rgb(10 132 255 / 0.6);
+  --field: rgb(255 255 255 / 0.04);
+  --field-hover: rgb(255 255 255 / 0.07);
+  --segment: rgb(255 255 255 / 0.12);
+  --chart-grid: rgb(255 255 255 / 0.07);
+
+  --sidebar: #1c1c1e;
+  --sidebar-foreground: #f5f5f7;
+  --sidebar-border: rgb(255 255 255 / 0.08);
+
+  --surface-shadow: inset 0 1px 0 rgb(255 255 255 / 0.03);
+  --raised-bg: #1c1c1e;
+  --raised-shadow: inset 0 1px 0 rgb(255 255 255 / 0.04), 0 24px 60px -28px rgb(0 0 0 / 0.75);
+  --chrome-bg: rgb(30 30 32 / 0.78);
+  --chrome-shadow: inset 0 1px 0 rgb(255 255 255 / 0.04), 0 12px 32px -20px rgb(0 0 0 / 0.6);
+  --overlay-shadow: 0 28px 80px -24px rgb(0 0 0 / 0.8);
+  --scrollbar-thumb: rgb(255 255 255 / 0.2);
+
+  /* 只留一层很淡的中性高光，让页面顶部不至于死黑 */
+  --page-bg: radial-gradient(1400px 700px at 50% -20%, rgb(255 255 255 / 0.035), transparent 70%) #161617;
+}
+
+:root {
+  /* beUI 组件共用的缓动 */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    scrollbar-width: thin;
+  }
+
+  html {
+    background: var(--page-bg);
+    scrollbar-color: var(--scrollbar-thumb) transparent;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  html,
+  body {
+    overscroll-behavior: none;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    color: var(--foreground);
+    font-feature-settings: "cv11", "ss01";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  ::selection {
+    background: rgb(0 122 255 / 0.3);
+  }
+
+  button,
+  [role="button"],
+  summary {
+    cursor: pointer;
+  }
+
+  button:disabled,
+  [role="button"][aria-disabled="true"] {
+    cursor: not-allowed;
+  }
+}
+
+@layer components {
+  /* 内容卡片：实色面 + 1px 发丝描边，几乎不用阴影 */
+  .surface {
+    background: var(--card);
+    border: 1px solid var(--border);
+    box-shadow: var(--surface-shadow);
+  }
+
+  /* 需要从页面里"浮"出来的面板（登录卡片、输入区） */
+  .surface-raised {
+    background: var(--raised-bg);
+    border: 1px solid var(--border);
+    box-shadow: var(--raised-shadow);
+  }
+
+  /* 悬浮外壳（侧栏、顶栏）：面积小且位置固定，才值得上实时模糊 */
+  .surface-chrome {
+    background: var(--chrome-bg);
+    border: 1px solid var(--sidebar-border);
+    box-shadow: var(--chrome-shadow);
+    -webkit-backdrop-filter: blur(20px) saturate(1.4);
+    backdrop-filter: blur(20px) saturate(1.4);
+  }
+
+  @media (prefers-reduced-transparency: reduce) {
+    .surface-chrome {
+      -webkit-backdrop-filter: none;
+      backdrop-filter: none;
+      background: var(--sidebar);
+    }
+  }
+}
+
+/* 小号全大写的分区标签（WORKSPACE OVERVIEW / CONSOLE） */
+@utility eyebrow {
+  font-size: 11px;
+  line-height: 1;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+}
+
+/* beUI 的按压反馈 */
+@utility press {
+  transition: transform 0.12s var(--ease-out);
+  &:active {
+    transform: scale(0.97);
+  }
+}
+
+@utility shadow-overlay {
+  box-shadow: var(--overlay-shadow);
+}
+
+@layer utilities {
+  .hide-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  .hide-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+@keyframes grow {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+/* 主题切换用 View Transition 做圆形扩散，关掉浏览器默认的交叉淡入 */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
