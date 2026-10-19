@@ -5,6 +5,7 @@ from typing import Any, Iterator
 
 from PIL import Image
 
+from services.config import config
 from services.protocol.conversation import (
     ConversationRequest,
     ImageGenerationError,
@@ -74,6 +75,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         images=encoded_images,
         message_as_error=True,
         progress_callback=progress_callback,
+        image_transport=body.get("_image_transport") or config.image_transport,
     ))
     if body.get("stream"):
         return stream_image_chunks(outputs)

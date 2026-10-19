@@ -15,9 +15,10 @@ from services.firefly import models as firefly_models
 from services.proxy_service import proxy_settings
 from utils.log import logger
 
-BASE_IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
+WEB_IMAGE_MODELS = {"gpt-image-2", "gpt-image-2.5"}
 IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
+BASE_IMAGE_MODELS = WEB_IMAGE_MODELS | {CODEX_IMAGE_MODEL}
 PREFIXED_CODEX_IMAGE_MODELS = {
     f"{plan_type}-{CODEX_IMAGE_MODEL}"
     for plan_type in IMAGE_MODEL_PLAN_TYPES

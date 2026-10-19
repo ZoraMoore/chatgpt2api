@@ -5,6 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "aiortc==1.15.0",
+    "quickjs-ng==0.17.0.1",
     "curl-cffi>=0.15.0",
     "fastapi>=0.136.0",
     "pillow>=12.2.0",

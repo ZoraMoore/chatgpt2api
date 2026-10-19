@@ -6,6 +6,7 @@ from typing import Any, Iterable, Iterator
 
 from fastapi import HTTPException
 
+from services.config import config
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
 from services.protocol.conversation import (
     ConversationRequest,
@@ -237,6 +238,7 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         n=n,
         response_format="b64_json",
         images=encode_images(images) or None,
+        image_transport=body.get("_image_transport") or config.image_transport,
     )))
     response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
     usage = image_usage(
@@ -256,6 +258,7 @@ def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         n=n,
         response_format="b64_json",
         images=encode_images(images) or None,
+        image_transport=body.get("_image_transport") or config.image_transport,
     ))
     yield from stream_image_chat_completion(image_outputs, model)
 

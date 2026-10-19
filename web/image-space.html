@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>清理图像空间 · 号池管理</title>
+<style>
+:root{color-scheme:light dark;--bg:#fafaf9;--panel:#fff;--border:#e7e5e4;--text:#292524;--muted:#78716c}
+@media(prefers-color-scheme:dark){:root{--bg:#1c1917;--panel:#292524;--border:#57534e;--text:#fafaf9;--muted:#a8a29e}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.7 system-ui,sans-serif}main{max-width:1100px;margin:32px auto;padding:0 20px}h1{font-size:24px;margin-bottom:8px}h2{font-size:17px}a{color:inherit}.muted{color:var(--muted)}section{padding:20px;background:var(--panel);border:1px solid var(--border);border-radius:12px;margin:20px 0}button,input{font:inherit}button{border:1px solid var(--border);border-radius:7px;padding:8px 14px;background:var(--panel);color:var(--text);cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}input[type=password],input[type=search]{padding:8px;border:1px solid var(--border);border-radius:7px;max-width:100%;background:var(--bg);color:var(--text)}input[type=checkbox]{margin-right:8px}.row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.danger{background:#b91c1c;color:#fff;border-color:#b91c1c}.scroll{overflow:auto;max-height:380px}table{border-collapse:collapse;width:100%;text-align:left}td,th{border-bottom:1px solid var(--border);padding:10px;white-space:nowrap}th{color:var(--muted);font-weight:500}#message{white-space:pre-wrap;color:#b45309}#results td:last-child{white-space:normal;min-width:180px}#confirmArea{border-left:3px solid #b91c1c;padding-left:16px}button:focus-visible,a:focus-visible,input:focus-visible{outline:2px solid #b45309;outline-offset:3px}
+</style>
+</head>
+<body><main>
+<a href="/accounts">← 返回号池管理</a>
+<h1>清理账号内的图像空间</h1>
+<p class="muted">将 ChatGPT 图像空间中当前可见的图片移入「最近删除」。不清空最近删除，不处理隐藏图片。仅删除本次预览中的图片；预览后新增的图片会保留。</p>
+<section>
+<div class="row"><label>管理密钥 <input id="key" type="password" autocomplete="off" placeholder="自动读取当前登录，也可手动填写"></label><button id="load">加载账号</button></div>
+<p class="muted">复用当前登录；手动输入的密钥仅用于本页请求，不另行保存。</p>
+<div class="row"><input id="search" type="search" aria-label="搜索账号" placeholder="搜索邮箱或账号名称"><button id="selectAll">选择筛选结果（最多 20 个）</button><button id="selectNone">清除选择</button><span id="selected">已选 0 个</span></div>
+<div class="scroll"><table><thead><tr><th>选择账号</th><th>类型</th></tr></thead><tbody id="accounts"></tbody></table></div>
+<p><button id="preview" disabled>预览所选账号的图片数量</button></p>
+</section>
+<p id="message" role="status" aria-live="polite"></p>
+<section id="jobPanel" hidden>
+<h2 id="jobTitle">任务进度</h2>
+<p class="muted">每批 25 张，等待索引更新后复扫。接口接受不等于删除成功；只有完整复扫确认图片已消失，才计入确认移出数。大号池可能需要较长时间。</p>
+<div class="scroll"><table><thead><tr><th>账号</th><th>状态</th><th>预览图片</th><th>已尝试</th><th>接口接受</th><th>确认移出</th><th>快照剩余</th><th>说明</th></tr></thead><tbody id="results"></tbody></table></div>
+<div id="confirmArea" hidden><p id="summary"></p><p><label><input id="confirm" type="checkbox">我确认将上表所列账号的预览图片移入最近删除</label></p><button id="execute" class="danger" disabled>确认删除预览中的图片</button></div>
+<p><button id="resume" hidden>重新读取任务进度</button></p>
+<p class="muted">关闭页面后后台任务仍会继续。预览和结果保留 30 分钟；服务重启会终止任务并清除记录，届时请重新预览确认实际状态。</p>
+</section>
+<script>
+(() => {
+const $ = id => document.getElementById(id);
+const states = {queued:'等待中',scanning:'正在扫描',ready:'等待确认',deleting:'正在删除',verifying:'等待索引并复核',running:'正在清理',completed:'完成',failed:'失败',partial:'部分账号未完成'};
+let accounts = [], selected = new Set(), jobId = '', timer, busy = false, loading = false, lastJob = null;
+async function api(path, body) {
+  const key = $('key').value.trim();
+  if (!key) throw new Error('请先登录管理面板或输入管理密钥');
+  const response = await fetch('/api/accounts/image-space/' + path, {method:body === undefined ? 'GET':'POST', headers:{Authorization:'Bearer '+key,'Content-Type':'application/json'}, ...(body === undefined ? {} : {body:JSON.stringify(body)})});
+  let data;
+  try { data = await response.json(); } catch (_) { throw new Error('服务返回异常，请稍后重试'); }
+  if (!response.ok) {
+    const error = new Error(data.detail?.error || '请求失败（HTTP '+response.status+'）');
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
+function message(text) { $('message').textContent = text; }
+function controls() {
+  $('preview').disabled = busy || loading || !selected.size;
+  $('load').disabled = busy || loading;
+  $('selectAll').disabled = busy || loading;
+  $('selectNone').disabled = busy || loading;
+  $('selected').textContent = '已选 '+selected.size+' 个';
+}
+function visible() { const query = $('search').value.trim().toLowerCase(); return accounts.filter(a => a.label.toLowerCase().includes(query)); }
+function renderAccounts() {
+  $('accounts').replaceChildren();
+  for (const account of visible()) {
+    const row = document.createElement('tr'), td = document.createElement('td'), label = document.createElement('label'), box = document.createElement('input');
+    box.type='checkbox';box.checked=selected.has(account.id);box.disabled=busy;
+    box.addEventListener('change', () => {
+      if (box.checked && selected.size >= 20) { box.checked=false;message('每次最多选择 20 个账号');return; }
+      if (box.checked) selected.add(account.id); else selected.delete(account.id);
+      controls();
+    });
+    label.append(box,document.createTextNode(account.label+' · '+account.id.slice(0,8)));td.append(label);row.append(td);
+    const plan=document.createElement('td');plan.textContent=account.type;row.append(plan);$('accounts').append(row);
+  }
+  controls();
+}
+async function load() {
+  loading=true;controls();
+  try { accounts=(await api('accounts')).items;const requested=new Set((new URLSearchParams(location.search).get('accounts')||'').split(',').filter(id=>/^[a-f0-9]{64}$/.test(id)).slice(0,20));selected=new Set(accounts.filter(a=>requested.has(a.id)).map(a=>a.id));renderAccounts();message(accounts.length ? '选择账号后先预览，确认前不会删除图片。':'号池中没有可清理的 ChatGPT 账号。'); }
+  catch(error){message(error.message);} finally {loading=false;controls();}
+}
+function renderJob(job) {
+  lastJob=job;
+  $('jobPanel').hidden=false;$('jobTitle').textContent='任务进度 · '+(states[job.status] || job.status);
+  busy=['scanning','running'].includes(job.status);
+  $('results').replaceChildren();
+  for(const account of job.accounts){
+    const row=document.createElement('tr');
+    for(const value of [account.label,states[account.phase] || account.phase,account.total,account.attempted,account.accepted,account.verified,account.remaining ?? '未确认',account.error || (account.sweep ? '第 '+account.sweep+' 轮复核':'')]){
+      const cell=document.createElement('td');cell.textContent=String(value);row.append(cell);
+    }
+    $('results').append(row);
+  }
+  const total=job.accounts.reduce((sum,a)=>sum+a.total,0);
+  $('confirmArea').hidden=job.status!=='ready' || !total;
+  $('summary').textContent='即将处理 '+job.accounts.length+' 个账号，共 '+total+' 张图片。请核对上表账号和数量。';
+  $('execute').disabled=!$('confirm').checked || job.status!=='ready';
+  renderAccounts();
+}
+async function poll() {
+  clearTimeout(timer);$('resume').hidden=true;
+  try {
+    const job=await api('jobs/'+jobId);renderJob(job);
+    if(busy) timer=setTimeout(poll,2000);
+    else if(job.status==='completed') message('任务已完成，预览快照中的图片已确认不在图像空间列表中。');
+    else if(job.status==='failed' || job.status==='partial') message('任务未全部完成，请查看各账号说明。已执行的操作不会回滚。');
+    else message('预览完成，请核对账号和图片数量。');
+  } catch(error) {
+    message(error.message);$('jobPanel').hidden=false;
+    if(error.status===404){
+      busy=false;jobId='';lastJob=null;sessionStorage.removeItem('image-space-job');
+      $('confirmArea').hidden=true;$('jobTitle').textContent='任务已过期，请重新预览';
+      renderAccounts();
+    } else {$('resume').hidden=false;}
+  }
+}
+$('load').onclick=load;$('search').oninput=renderAccounts;
+$('selectAll').onclick=()=>{const choices=visible();if(choices.length>20){message('筛选结果超过 20 个，请缩小范围或逐个勾选');return;}selected=new Set(choices.map(a=>a.id));renderAccounts();};
+$('selectNone').onclick=()=>{selected.clear();renderAccounts();};
+$('preview').onclick=async()=>{
+  busy=true;renderAccounts();$('confirmArea').hidden=true;$('confirm').checked=false;clearTimeout(timer);
+  try {const job=await api('preview',{account_ids:[...selected]});jobId=job.id;sessionStorage.setItem('image-space-job',jobId);await poll();}
+  catch(error){busy=false;renderAccounts();message(error.message);}
+};
+$('confirm').onchange=()=>{$('execute').disabled=!$('confirm').checked || lastJob?.status!=='ready';};
+$('execute').onclick=async()=>{
+  $('execute').disabled=true;$('confirm').checked=false;
+  try {await api('jobs/'+jobId+'/execute',{confirm:true});busy=true;renderAccounts();await poll();}
+  catch(error){message(error.message);$('resume').hidden=false;}
+};
+$('resume').onclick=poll;
+async function savedKey() {
+  // 与现有管理面板 localforage 的数据库、对象仓库和键保持一致；只读，不新建仓库。
+  const fromDB=await new Promise(resolve=>{
+    let done=false;const finish=value=>{if(!done){done=true;resolve(value);}};
+    const request=indexedDB.open('chatgpt2api');
+    request.onupgradeneeded=()=>request.transaction.abort();
+    request.onerror=()=>finish('');request.onblocked=()=>finish('');
+    request.onsuccess=()=>{const db=request.result;if(!db.objectStoreNames.contains('auth')){db.close();finish('');return;}
+      const tx=db.transaction('auth','readonly'), read=tx.objectStore('auth').get('chatgpt2api_auth_key');
+      read.onsuccess=()=>finish(typeof read.result==='string'?read.result:'');read.onerror=()=>finish('');tx.oncomplete=()=>db.close();tx.onabort=()=>{db.close();finish('');};};
+    setTimeout(()=>finish(''),1500);
+  });
+  if(fromDB) return fromDB;
+  try{return JSON.parse(localStorage.getItem('chatgpt2api/auth/chatgpt2api_auth_key') || '""');}catch(_){return '';}
+}
+(async()=>{try{$('key').value=await savedKey();jobId=sessionStorage.getItem('image-space-job') || '';if($('key').value){await load();if(/^[a-f0-9]{32}$/.test(jobId)) await poll();}}catch(_){message('请输入管理密钥后加载账号');}})();
+})();
+</script>
+</main></body></html>

@@ -1,0 +1,3 @@
+# 从主站同步基线增量构建，只在 Image 测试站验证传输开销优化。
+FROM local/chatgpt2api-image:sync-api-a909e643933d
+COPY services/openai_backend_api.py /app/services/openai_backend_api.py

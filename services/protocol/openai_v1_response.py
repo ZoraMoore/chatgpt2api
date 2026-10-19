@@ -6,6 +6,7 @@ from typing import Any, Iterable, Iterator
 
 from fastapi import HTTPException
 
+from services.config import config
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
 from services.protocol.conversation import (
     ConversationRequest,
@@ -442,6 +443,7 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         quality=str(tool.get("quality") or "auto"),
         response_format="b64_json",
         images=images,
+        image_transport=body.get("_image_transport") or config.image_transport,
     ))
     yield from stream_image_response(image_outputs, prompt, model, input_image_tokens, tool.get("size"), str(tool.get("quality") or "auto"))
 
