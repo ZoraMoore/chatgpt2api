@@ -1,5 +1,7 @@
 (() => {
   'use strict';
+  // 页面样式独立加载；所有路由共用此入口，支持 Next 客户端导航。
+  import('/account-pool-layout.js?v=20261019-1').catch(() => {});
   if (window.__accountOperationsMounted) return;
   window.__accountOperationsMounted = true;
   const prefix = 'chatgpt2api:account-operations:';
