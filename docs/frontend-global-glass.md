@@ -41,6 +41,17 @@ docker build -f frontend/Dockerfile --target export \
 
 ## 发布与回退
 
+前端叠加镜像必须显式使用当前运行镜像作为基础，避免撤销后续后端和安全更新。在项目根目录执行：
+
+```bash
+frontend_base_image=$(docker inspect chatgpt2api-image --format '{{.Config.Image}}')
+docker build --build-arg BASE_IMAGE="$frontend_base_image" \
+  -f docker/global-glass/Dockerfile \
+  -t local/chatgpt2api-image:global-glass-current .
+```
+
+构建会检查七个页面入口的玻璃前端标记及兼容样式。更换基础镜像后，仍必须使用已有浏览器回归确认六页布局；`/version` 或健康检查成功只能说明服务可用，不能证明前端版本正确。
+
 先完成构建、源码检查与整站浏览器验证，再备份测试站的 `web_dist`、三个兼容脚本和 Compose 镜像引用。先放置新资源，再切换页面文件，保留旧 `_next` 资源以兼容已打开的浏览器；配置、账号、卷和后端源码不随前端更新替换。
 
 运行容器可以仅更新静态资源而不重启。与此同时构建并保存前端叠加镜像，Compose 引用该镜像，使后续重建容器保留相同页面。回退时恢复前端备份和原镜像引用，不回滚账号或业务数据。
@@ -59,3 +70,9 @@ docker build -f frontend/Dockerfile --target export \
 - 生图记录缺失与恢复仅查询，不隐式重放生成请求；设置干净重入重新读取，未保存编辑及迟到响应受保护。
 
 测试站只替换 134 个前端文件，保留旧资源供已打开的页面使用；88 个后端文件、两个容器的身份/启动时间/挂载、配置与环境均校验一致。已保存独立前端备份和可供后续重建的叠加镜像。浏览器验证使用合成数据及严格模拟接口，没有触发真实生图、账号修改或外部同步；不代表实际上游生成验证。
+
+## 2026-10-23 前端恢复记录
+
+测试站在北京时间 2026-10-22 00:33 重建时改用了带旧静态页面的 `local/security/chatgpt2api-image:20261022`。重构源码、宿主机 `web_dist` 和 GitHub 提交 `dab3978` 均完整；回退发生在运行镜像的前端资源。本站未挂载宿主机的 `web_dist`，因此宿主机文件存在并不代表容器正在提供相同版本。
+
+本次以当前安全镜像为基础生成 `local/security/chatgpt2api-image:global-glass-20261023`，仅叠加保存的 134 个前端文件，同时更新测试站 Compose 镜像引用。运行容器无需重启；88 个后端文件、当前安全基础层、账号配置和数据挂载保持不变。后续任何安全重建也应从当前发布镜像继续派生，并在上线前检查前端标记和实际浏览器布局。

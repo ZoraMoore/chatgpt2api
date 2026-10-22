@@ -3,7 +3,7 @@ name: chatgpt2api-image
 services:
   chatgpt2api-image:
     # 同步主站已验证的运行镜像，保留本站独立配置和数据。
-    image: local/chatgpt2api-image:global-glass-20261020
+    image: local/security/chatgpt2api-image:global-glass-20261023
     container_name: chatgpt2api-image
     restart: unless-stopped
     stop_grace_period: 120s
