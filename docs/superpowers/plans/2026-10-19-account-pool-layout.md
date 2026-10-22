@@ -22,8 +22,8 @@
 
 - `node --check web_dist/account-pool-layout.js` 与 `node --check web/account-image-space.js`：检查扩展脚本语法。
 - `node tests/test_session_import.mjs` 与 `node tests/test_account_operations_ui.mjs`：检查会话导入和账号操作事件桥。
-- 浏览器环境需安装 Playwright，设置 `CHROMIUM_PATH` 指向已安装的 Chromium；通过 `BASE_URL=http://127.0.0.1:18219 SCREENSHOT_DIR=/tmp/account-pool-screenshots python tests/test_account_pool_layout.py` 运行 6 组场景。目标服务器须已提供本次静态资源；所有 API 请求在浏览器内使用模拟数据，不写入真实账号。未显式设置 BASE_URL 或未安装 Playwright 时跳过浏览器测试。
-- `docker build -f docker/account-layout/Dockerfile -t local/chatgpt2api-image:account-layout-20261019 .`：在当前测试站镜像上只叠加三个前端文件。比较候选镜像与运行容器的源文件哈希，确认差异仅为本次三个资源。
+- 浏览器环境需安装 Playwright，设置 `CHROMIUM_PATH` 指向已安装的 Chromium；通过 `BASE_URL=http://127.0.0.1:18219 SCREENSHOT_DIR=./local-verification python tests/test_account_pool_layout.py` 运行 6 组场景。目标服务器须已提供本次静态资源；所有 API 请求在浏览器内使用模拟数据，不写入真实账号。未显式设置 BASE_URL 或未安装 Playwright 时跳过浏览器测试。
+- `docker build -f docker/account-layout/Dockerfile -t chatgpt2api:example .`：在当前测试站镜像上只叠加三个前端文件。比较候选镜像与运行容器的源文件哈希，确认差异仅为本次三个资源。
 - 运行容器仅对三个前端文件做同目录临时文件重命名更新，不重启服务。Compose 指向已构建的新镜像，使下次重建容器仍保留页面改动；本次运行容器继续使用原容器身份和挂载。
 - 页面更新回退：恢复备份的 `web/account-image-space.js`，删除新增的 `web_dist/account-pool-layout.js`、`web_dist/account-pool-layout.css`，恢复 Compose 原镜像引用。新资源失效不会影响既有账号操作。
 

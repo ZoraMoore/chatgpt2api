@@ -21,11 +21,11 @@ docker run --rm --memory 2g --cpus 2 \
   sh -c 'npm ci --ignore-scripts --no-audit --no-fund && npm run test && npm run build'
 ```
 
-也可用独立导出镜像生成 `/tmp/chatgpt2api-frontend-export/web_dist`：
+也可用独立导出镜像生成 `./local-verification`：
 
 ```bash
 docker build -f frontend/Dockerfile --target export \
-  --output type=local,dest=/tmp/chatgpt2api-frontend-export .
+  --output type=local,dest=./local-verification .
 ```
 
 构建会执行 TypeScript 检查，不忽略类型错误。前端来源、适配范围和许可见 `frontend/SOURCE.md` 与 `frontend/THIRD_PARTY_LICENSE`。
@@ -47,7 +47,7 @@ docker build -f frontend/Dockerfile --target export \
 frontend_base_image=$(docker inspect chatgpt2api-image --format '{{.Config.Image}}')
 docker build --build-arg BASE_IMAGE="$frontend_base_image" \
   -f docker/global-glass/Dockerfile \
-  -t local/chatgpt2api-image:global-glass-current .
+  -t chatgpt2api:example .
 ```
 
 构建会检查七个页面入口的玻璃前端标记及兼容样式。更换基础镜像后，仍必须使用已有浏览器回归确认六页布局；`/version` 或健康检查成功只能说明服务可用，不能证明前端版本正确。
@@ -58,21 +58,8 @@ docker build --build-arg BASE_IMAGE="$frontend_base_image" \
 
 发布后核对六个公开页面及关键资源哈希，并使用公开站点的真实静态页面再运行模拟接口浏览器回归。此验证证明前端链路，不替代实际上游生成验证。
 
-## 2026-10-20 交付验证
+## 发布验收与版本保护
 
-六页左侧导航、手机抽屉、蓝白玻璃与深色、外观偏好、命令面板、任务中心及 48 项交互组件预览已集成。保留完整会话/credentials 导入、账号操作和图片空间清理、图片管理开关、日志北京时间与分页、传输模式及原设置分组。
+公开说明不提供个人实例的运行镜像、部署时间、账号统计或容器信息。以当前运行镜像为基础叠加前端，并在构建时检查七个页面的标记及兼容样式；随后核对六页实际布局、前端资源哈希和核心交互。
 
-- 源码语义测试 70/70，通过严格 TypeScript 检查与完整静态构建。
-- 完整会话导入、安全事件桥两个兼容校验通过。
-- 本地整站浏览器 15/15；公开测试站整站浏览器 15/15。覆盖六页直达与 SPA、1440/768/375 三宽、权限、动态偏好、48 项组件及任务深链。
-- 旧账号操作弹窗在本地和公网均通过暗色颜色、零脚本异常、零未知请求及零未预期写入校验。
-- 公开七个页面入口更新，40 个关键资源哈希与发布包一致。
-- 生图记录缺失与恢复仅查询，不隐式重放生成请求；设置干净重入重新读取，未保存编辑及迟到响应受保护。
-
-测试站只替换 134 个前端文件，保留旧资源供已打开的页面使用；88 个后端文件、两个容器的身份/启动时间/挂载、配置与环境均校验一致。已保存独立前端备份和可供后续重建的叠加镜像。浏览器验证使用合成数据及严格模拟接口，没有触发真实生图、账号修改或外部同步；不代表实际上游生成验证。
-
-## 2026-10-23 前端恢复记录
-
-测试站在北京时间 2026-10-22 00:33 重建时改用了带旧静态页面的 `local/security/chatgpt2api-image:20261022`。重构源码、宿主机 `web_dist` 和 GitHub 提交 `dab3978` 均完整；回退发生在运行镜像的前端资源。本站未挂载宿主机的 `web_dist`，因此宿主机文件存在并不代表容器正在提供相同版本。
-
-本次以当前安全镜像为基础生成 `local/security/chatgpt2api-image:global-glass-20261023`，仅叠加保存的 134 个前端文件，同时更新测试站 Compose 镜像引用。运行容器无需重启；88 个后端文件、当前安全基础层、账号配置和数据挂载保持不变。后续任何安全重建也应从当前发布镜像继续派生，并在上线前检查前端标记和实际浏览器布局。
+若健康检查正常但前端退回旧布局，先比较运行容器与待发布包的静态资源，不根据宿主机文件存在就认定线上版本一致。修复只覆盖选定前端资源，保留后端安全更新、配置和数据。具体发布和回退记录保存在受保护的本地运维台账。

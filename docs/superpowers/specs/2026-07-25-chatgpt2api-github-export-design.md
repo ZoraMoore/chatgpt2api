@@ -2,7 +2,7 @@
 
 ## 目标
 
-将当前运行中的 chatgpt2api Docker 镜像导出为可复现部署的 Git 仓库，并推送到私有仓库 `ZoraMoore/chatgpt2api`。
+将当前运行中的 chatgpt2api Docker 镜像导出为可复现部署的 Git 仓库，并推送到私有仓库 `OWNER/chatgpt2api`。
 
 ## 范围
 

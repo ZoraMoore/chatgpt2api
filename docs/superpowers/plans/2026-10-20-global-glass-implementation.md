@@ -10,7 +10,7 @@
 
 ## 任务 1 源码恢复和兼容基线
 
-- [x] 创建 `/tmp/chatgpt2api-global-glass-20261020` 隔离 worktree。
+- [x] 创建 `./local-verification` 隔离 worktree。
 - [x] 恢复 frontend 源码、来源和 MIT 许可，排除参考项目配置与凭据。
 - [x] 固定 npm lock，检查构建配置不得忽略 TypeScript 错误。
 - [x] 在 `frontend/src/lib/api.ts` 适配当前日志列表、账号字段、图片管理开关和设置传输模式。
