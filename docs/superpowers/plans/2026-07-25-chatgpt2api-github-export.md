@@ -174,7 +174,7 @@ Expected: 命令没有输出，证明工作目录没有生产运行数据。
 
 **Files:**
 - Modify: `.git/`（本地 Git 元数据）
-- Remote: `https://github.com/ZoraMoore/chatgpt2api`
+- Remote: `https://github.com/OWNER/chatgpt2api`
 
 - [ ] **Step 1: 初始化 Git 并创建首个提交**
 
@@ -191,7 +191,7 @@ Expected: `main` 分支存在，首个提交只包含源码、部署文件、REA
 
 - [ ] **Step 2: 创建私有仓库并推送**
 
-Run: `gh repo create ZoraMoore/chatgpt2api --private --source=. --remote=origin --push`
+Run: `gh repo create OWNER/chatgpt2api --private --source=. --remote=origin --push`
 
 Expected: `origin` 指向 GitHub 私有仓库，`main` 已推送。
 
@@ -200,7 +200,7 @@ Expected: `origin` 指向 GitHub 私有仓库，`main` 已推送。
 Run:
 
 ```bash
-gh repo view ZoraMoore/chatgpt2api --json nameWithOwner,visibility,url
+gh repo view OWNER/chatgpt2api --json nameWithOwner,visibility,url
 git ls-tree -r --name-only origin/main | grep -E '(^data/|^config.json$|^\.env$|accounts\.json|auth_keys\.json|sub2api_config\.json|logs\.jsonl)'
 ```
 
