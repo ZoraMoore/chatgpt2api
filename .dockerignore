@@ -1,6 +1,6 @@
-.git/
-.runtime/
+.git
 .venv/
+.runtime/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -9,8 +9,10 @@ config.json
 .env
 .env.*
 docs/
-
 frontend/node_modules/
 frontend/.next/
 frontend/out/
 frontend/*.tsbuildinfo
+docker/
+scripts/sentinel_worker.mjs
+scripts/test_image_protocol.py

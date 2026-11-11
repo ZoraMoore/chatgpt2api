@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from threading import Event, Thread
+from services.image_quota import active_image_limit
 
 from fastapi import HTTPException, Request
 
@@ -70,8 +71,9 @@ def sanitize_cpa_pools(pools: list[dict]) -> list[dict]:
 def sanitize_sub2api_server(server: dict | None) -> dict | None:
     if not isinstance(server, dict):
         return None
-    sanitized = {key: value for key, value in server.items() if key not in {"password", "api_key"}}
+    sanitized = {key: value for key, value in server.items() if key not in {"password", "api_key", "totp_secret", "totp_secret_encrypted"}}
     sanitized["has_api_key"] = bool(str(server.get("api_key") or "").strip())
+    sanitized["has_totp_secret"] = bool(server.get("totp_secret_encrypted"))
     return sanitized
 
 
@@ -90,6 +92,8 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
                 expiring_tokens = account_service.list_expiring_access_tokens()
                 keepalive_tokens = account_service.list_refresh_token_keepalive_tokens()
                 tokens = list(dict.fromkeys([*limited_tokens, *normal_tokens, *expiring_tokens]))
+                # 额度冷却由到期检查负责，普通资料批刷新不能拖延它或重复碰上游。
+                tokens = [token for token in tokens if token in expiring_tokens or not active_image_limit(account_service.get_account(token))]
                 expiring_token_set = set(expiring_tokens)
                 keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
                 if tokens:
@@ -106,9 +110,20 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
                     if result.get("errors"):
                         print(f"[account-watcher] keepalive errors: {result['errors']}")
             except Exception as exc:
-                print(f"[account-watcher] fail {exc}")
+                print(f"[account-watcher] fail {type(exc).__name__}")
             stop_event.wait(interval_seconds)
 
+    def quota_worker():
+        while not stop_event.is_set():
+            # 只转换本地到期状态；没有网络请求，也不需要后台生成探测图。
+            for token in account_service.list_due_image_limits():
+                try:
+                    account_service._refresh_image_limit(token)
+                except Exception:
+                    pass  # 单个账号写入失败不会阻塞其他到期账号。
+            account_service.image_limit_wake.wait(min(1.0, account_service.image_limit_check_delay()))
+            account_service.image_limit_wake.clear()
+    Thread(target=quota_worker, name="image-quota-watcher", daemon=True).start()
     thread = Thread(target=worker, name="account-watcher", daemon=True)
     thread.start()
     return thread

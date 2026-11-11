@@ -9,6 +9,12 @@ from services.account_operations import AccountOperations
 
 
 class AccountOperationsTests(unittest.TestCase):
+    def test_operation_label_uses_source_name_instead_of_refreshed_email(self):
+        manager, accounts, _ = self.manager()
+        access_token = accounts.list_tokens()[0]
+        accounts.update_account(access_token, {"name": "原站账号名", "email": "profile@example.test"}, quiet=True)
+        self.assertEqual("原站账号名", manager.list()[0]["label"])
+
     def manager(self):
         now = int(time.time())
         accounts, storage = make_service([{"access_token": token(now,now+3600), "refresh_token": "secret-refresh",

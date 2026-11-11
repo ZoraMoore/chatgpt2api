@@ -2,6 +2,31 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import * as accountParsers from "./account-import-parsers.ts";
 
+test("账号导入隔离新增生图管理字段并保留来源priority和其他元数据", () => {
+  const management = {
+    image_priority: 0, image_priority_mode: "manual", image_priority_manual: 0,
+    image_quota_cap: 1000, image_quota_used: 0, image_quota_available: 1000,
+    image_quota_reserved: 1, image_quota_uncertain: 2,
+    image_quota_baseline: "known", image_quota_reset_at: "2026-11-08T00:00:00Z",
+  };
+  for (const raw of [
+    { access_token: "fixture-access", priority: 7, image_cleanup_enabled: true, ...management },
+    { priority: 7, image_cleanup_enabled: true, ...management,
+      credentials: { access_token: "fixture-access", priority: 8, ...management } },
+  ]) {
+    const payload = accountParsers.getAccountJsonAccount(raw);
+    assert.ok(payload);
+    assert.equal(payload.priority, 7);
+    assert.equal(payload.image_cleanup_enabled, true);
+    for (const key of Object.keys(management)) {
+      assert.equal(Object.hasOwn(payload, key), false);
+      if (payload.credentials) {
+        assert.equal(Object.hasOwn(payload.credentials as object, key), false);
+      }
+    }
+  }
+});
+
 test("无效 JSON 的错误不会回显凭据片段且限制输入大小", () => {
   assert.equal(typeof accountParsers.parseImportJson, "function");
   for (const input of ["{fixture-private-session", "x".repeat(262145)]) {
@@ -30,16 +55,16 @@ const sub2apiExport = {
       confirm_mixed_channel_risk: true,
       credentials: {
         access_token: "AT_REAL",
-        chatgpt_user_id: "user-BjL72oLAu3udOTV8xQYE0UuS",
-        client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
-        email: "qkduvp20912@outlook.com",
+        chatgpt_user_id: "user-fixture",
+        client_id: "app_fixture",
+        email: "fixture-1@example.test",
         expires_at: 1786540052,
         id_token: "IDT_REAL",
-        organization_id: "org-yAOaPEVldApg2zfQCDJXBVF6",
+        organization_id: "org-fixture",
         plan_type: "free",
-        refresh_token: "rt.1.AADma2k",
+        refresh_token: "fixture-refresh-token",
       },
-      name: "qkduvp20912@outlook.com",
+      name: "fixture-1@example.test",
       platform: "openai",
       priority: 1,
       rate_multiplier: 1,
@@ -114,9 +139,9 @@ test("keeps the OAuth credentials from a Sub2API export", () => {
 
   const account = result.accounts[0];
   assert.equal(account.access_token, "AT_REAL");
-  assert.equal(account.refresh_token, "rt.1.AADma2k");
+  assert.equal(account.refresh_token, "fixture-refresh-token");
   assert.equal(account.id_token, "IDT_REAL");
-  assert.equal(account.email, "qkduvp20912@outlook.com");
+  assert.equal(account.email, "fixture-1@example.test");
   assert.equal(account.plan_type, "free");
   assert.equal(account.expires_at, 1786540052);
   assert.equal(account.source_type, "codex");

@@ -13,6 +13,7 @@ import uuid
 
 from aiortc import AudioStreamTrack, RTCBundlePolicy, RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from curl_cffi import CurlMime
+from curl_cffi.requests.exceptions import RequestException
 
 from services.voice_delta import DeltaDecoder
 from services.voice_protocol import normalize_bundle_candidates, pack_event, session_payload, unpack_event
@@ -105,6 +106,7 @@ class VoiceImageSession:
         self.decoder = DeltaDecoder()
         self.thread: threading.Thread | None = None
         self.sent = False
+        self.acknowledged_message_id = ""
         self.completed = False
         self.fatal: VoiceImageError | None = None
         self.pc = None
@@ -205,6 +207,11 @@ class VoiceImageSession:
                     self._emit({"conversation_id": cid, "type": "voice_conversation_bound"})
             if not self.sent or self.completed:
                 return
+            if (kind == "relay_message_processed" and isinstance(self.message.get("id"), str)
+                    and payload.get("message_id") == self.message["id"]):
+                # send() 返回不代表上游已接收；仅精确回执允许断连后读取原任务。
+                self.acknowledged_message_id = self.message["id"]
+                self.diagnostics["submission_acknowledged"] = True
             if kind == "spawn_update":
                 self.state.spawn(payload)
                 self.diagnostics["active_spawns"] = len(self.state.active_spawns)
@@ -338,6 +345,8 @@ class VoiceImageSession:
                     if self.fatal or self.stop.is_set() or time.monotonic() >= self.deadline:
                         raise self.fatal or VoiceImageError("connection_failed")
                     # 传输报错时也不能重发；远端可能已经接收。与 close 共用锁，禁止停止后提交。
+                    from services.image_submission import guard_image_submission
+                    guard_image_submission(self.backend)
                     self.sent = True
                     self._stage("submitting")
                     self.diagnostics["text_submissions"] = 1
@@ -364,8 +373,11 @@ class VoiceImageSession:
             self._error("deadline_exceeded", "session_deadline")
             self._emit(self.fatal)
         except Exception as exc:
-            self._error(exc.code if isinstance(exc, VoiceImageError) else "connection_failed", "session_loop", exc)
-            self._emit(self.fatal)
+            if getattr(exc, "before_generation_submit", False) is True:
+                self._emit(exc)
+            else:
+                self._error(exc.code if isinstance(exc, VoiceImageError) else "connection_failed", "session_loop", exc)
+                self._emit(self.fatal)
         finally:
             self.stop.set()
             self._stage("closing")
@@ -439,6 +451,67 @@ class VoiceImageSession:
                 logger.error({"event": "voice_image_close_timeout", "session_id": self.diagnostics["session_id"]})
 
 
+def _recover_voice_image(backend, session):
+    from services.image_quota import ImageQuotaExceeded
+    from services.protocol.conversation_document import allows_image_terminal_check
+    from services.protocol.terminal_image_delivery import _branch, _successful
+    from utils.helper import UpstreamHTTPError
+
+    cid = session.state.conversation_id
+    session.close()
+    session._diagnostic(recovery_started=True)
+    backend._report_progress("checking_original_conversation")
+    while True:
+        remaining = session.deadline - time.monotonic()
+        if remaining <= 0:
+            raise VoiceImageError("deadline_exceeded", cid)
+        try:
+            document = backend._get_conversation(cid, timeout_secs=min(15.0, remaining))
+        except ImageQuotaExceeded:
+            raise
+        except UpstreamHTTPError as exc:
+            if exc.status_code not in {404, 408, 429, 500, 502, 503, 504}:
+                raise VoiceImageError("connection_failed", cid) from exc
+            document = None
+        except (RequestException, TimeoutError, ConnectionError):
+            document = None
+        if time.monotonic() >= session.deadline:
+            raise VoiceImageError("deadline_exceeded", cid)
+        # 复用终态交付器的完整分支校验；既不能读取其他轮次，也不能把工具中间图当最终图。
+        ids = [document[k] for k in ("conversation_id", "id") if k in document] if isinstance(document, dict) else []
+        messages = (_branch(document) if ids and all(value == cid for value in ids)
+                    and allows_image_terminal_check(document) else None)
+        if messages:
+            users = [m["id"] for m in messages if m["author"]["role"] == "user"]
+            submitted = session.message["id"]
+            turn_start = next((i for i, m in enumerate(messages) if m["id"] == submitted), -1)
+            turn = messages[turn_start:] if turn_start >= 0 else []
+            final = turn[-1] if turn else {}
+            metadata = final.get("metadata", {})
+            complete = (users and users[-1] == submitted and final.get("author", {}).get("role") == "assistant"
+                        and final.get("channel") == "final" and final.get("recipient", "all") == "all"
+                        and final.get("end_turn") is True and metadata.get("is_complete", True) is True
+                        and metadata.get("bidi_voice_fem_message") is not True
+                        and all(_successful(m) for m in turn))
+            if complete:
+                with session.lock:
+                    session.state.messages = {m["id"]: copy.deepcopy(m) for m in messages}
+                    session.completed = True
+                    session._diagnostic(recovery_complete=True)
+                logger.info({"event": "voice_image_recovered", "conversation_id": cid,
+                             "session_id": session.diagnostics["session_id"], "text_submissions": 1})
+                for message in messages:
+                    yield json.dumps({"conversation_id": cid, "message": message, "_voice_transport": True},
+                                     ensure_ascii=False, separators=(",", ":"))
+                yield json.dumps({"type": "voice_turn_complete", "conversation_id": cid})
+                yield "[DONE]"
+                return
+        remaining = session.deadline - time.monotonic()
+        if remaining <= 0:
+            raise VoiceImageError("deadline_exceeded", cid)
+        time.sleep(min(2.0, remaining))
+
+
 def stream_voice_image(backend, prompt: str, model: str, images: list[str], timeout_secs: float):
     from services.proxy_service import proxy_settings
     if not isinstance(prompt, str) or not 1 <= len(prompt) <= 65536 or not isinstance(images, list) or len(images) > 10:
@@ -448,7 +521,22 @@ def stream_voice_image(backend, prompt: str, model: str, images: list[str], time
     backend._report_progress("uploading")
     references = [backend._upload_image(image, f"image_{index}.png") for index, image in enumerate(images, 1)]
     message = backend._image_generation_payload(prompt, model, references)["messages"][0]
+    message_id = message.get("id")
+    if not isinstance(message_id, str) or re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", message_id) is None:
+        raise VoiceImageError("invalid_event")
+    backend._image_submitted_message_id = message_id
     backend._report_progress("preparing_conversation")
     session = VoiceImageSession(backend, message, backend._image_model_slug(model), timeout_secs)
     backend._voice_image_session = session
-    yield from session.stream()
+    try:
+        yield from session.stream()
+    except VoiceImageError as exc:
+        cid = session.state.conversation_id
+        if (exc.code != "connection_failed" or not session.sent
+                or session.acknowledged_message_id != message_id
+                or not isinstance(cid, str) or re.fullmatch(r"[a-f0-9-]{36}", cid) is None
+                or backend.image_conversation_id != cid
+                or exc.conversation_id and exc.conversation_id != cid):
+            raise
+        # 同一账号只做 GET 续查，不建立新语音会话，不回退或重放普通生图 POST。
+        yield from _recover_voice_image(backend, session)

@@ -43,11 +43,12 @@ import {
 } from "@/components/ui/select";
 import {
   createSub2APIServer,
+  completeSub2APILogin,
   deleteSub2APIServer,
-  fetchSub2APIServerAccounts,
   fetchSub2APIServerGroups,
   fetchSub2APIServers,
   startSub2APIImport,
+  syncSub2APIServer,
   updateSub2APIServer,
   type Sub2APIRemoteAccount,
   type Sub2APIRemoteGroup,
@@ -57,6 +58,14 @@ import {
 const PAGE_SIZE_OPTIONS = ["50", "100", "200"] as const;
 
 type AuthMode = "password" | "api_key";
+const syncErrorLabels: Record<string, string> = {
+  LOGIN_FAILED: "源站登录失败，请检查管理员邮箱和密码",
+  LOGIN_2FA_INVALID: "二次验证失败，请检查 2FA 密钥及服务器时间",
+  STEP_UP_INVALID: "凭据导出验证失败，将稍后重试",
+  SESSION_EXPIRED: "源站会话已过期，将重新登录",
+  SYNC_FAILED: "同步失败，请检查连接配置和 2FA 密钥",
+  UPSTREAM_ERROR: "源站暂时无法响应，将稍后重试",
+};
 
 function normalizeAccounts(items: Sub2APIRemoteAccount[]) {
   const seen = new Set<string>();
@@ -95,6 +104,10 @@ export function Sub2APIConnections() {
   const [formPassword, setFormPassword] = useState("");
   const [formApiKey, setFormApiKey] = useState("");
   const [formGroupId, setFormGroupId] = useState("");
+  const [formTotpSecret, setFormTotpSecret] = useState("");
+  const [formClearTotp, setFormClearTotp] = useState(false);
+  const [formAutoSync, setFormAutoSync] = useState(false);
+  const [formSyncInterval, setFormSyncInterval] = useState(5);
   const [authMode, setAuthMode] = useState<AuthMode>("password");
   const [showSecret, setShowSecret] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -104,6 +117,11 @@ export function Sub2APIConnections() {
 
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [loadingAccountsId, setLoadingAccountsId] = useState<string | null>(null);
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [loginServer, setLoginServer] = useState<Sub2APIServer | null>(null);
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginCode, setLoginCode] = useState("");
+  const [isVerifyingLogin, setIsVerifyingLogin] = useState(false);
 
   const [browserOpen, setBrowserOpen] = useState(false);
   const [browserServer, setBrowserServer] = useState<Sub2APIServer | null>(null);
@@ -113,6 +131,7 @@ export function Sub2APIConnections() {
   const [accountPage, setAccountPage] = useState(1);
   const [pageSize, setPageSize] = useState<(typeof PAGE_SIZE_OPTIONS)[number]>("100");
   const [isStartingImport, setIsStartingImport] = useState(false);
+  const [importStepUpCode, setImportStepUpCode] = useState("");
 
   const loadServers = async () => {
     setIsLoading(true);
@@ -138,7 +157,8 @@ export function Sub2APIConnections() {
     const hasRunningJobs = servers.some(
       (server) => server.import_job?.status === "pending" || server.import_job?.status === "running",
     );
-    if (!hasRunningJobs) {
+    const hasAutoSync = servers.some((server) => server.auto_sync_enabled);
+    if (!hasRunningJobs && !hasAutoSync) {
       if (pollTimerRef.current !== null) {
         window.clearInterval(pollTimerRef.current);
         pollTimerRef.current = null;
@@ -158,7 +178,7 @@ export function Sub2APIConnections() {
           }
           toast.error(error instanceof Error ? error.message : "查询导入进度失败");
         });
-    }, 1500);
+    }, hasRunningJobs ? 1500 : 10000);
 
     return () => {
       if (pollTimerRef.current !== null) {
@@ -169,6 +189,10 @@ export function Sub2APIConnections() {
   }, [servers]);
 
   const openAddDialog = () => {
+    setFormTotpSecret("");
+    setFormClearTotp(false);
+    setFormAutoSync(false);
+    setFormSyncInterval(5);
     setEditingServer(null);
     setFormName("");
     setFormBaseUrl("");
@@ -183,6 +207,10 @@ export function Sub2APIConnections() {
   };
 
   const openEditDialog = (server: Sub2APIServer) => {
+    setFormTotpSecret("");
+    setFormClearTotp(false);
+    setFormAutoSync(server.auto_sync_enabled === true);
+    setFormSyncInterval(server.sync_interval_minutes || 5);
     setEditingServer(server);
     setFormName(server.name);
     setFormBaseUrl(server.base_url);
@@ -218,6 +246,14 @@ export function Sub2APIConnections() {
   };
 
   const handleSave = async () => {
+    if (!Number.isInteger(formSyncInterval) || formSyncInterval < 1 || formSyncInterval > 1440) {
+      toast.error("同步间隔需为 1 至 1440 分钟");
+      return;
+    }
+    if (formAutoSync && (authMode !== "password" || (!formTotpSecret.trim() && (!editingServer?.has_totp_secret || formClearTotp)))) {
+      toast.error("自动同步需要管理员邮箱、密码和 2FA 密钥");
+      return;
+    }
     if (!formBaseUrl.trim()) {
       toast.error("请输入 Sub2API 地址");
       return;
@@ -243,7 +279,11 @@ export function Sub2APIConnections() {
           name: formName.trim(),
           base_url: formBaseUrl.trim(),
           group_id: formGroupId.trim(),
+          auto_sync_enabled: formAutoSync,
+          sync_interval_minutes: formSyncInterval,
+          clear_totp_secret: formClearTotp,
         };
+        if (formTotpSecret.trim()) updates.totp_secret = formTotpSecret.trim();
         if (authMode === "password") {
           updates.email = formEmail.trim();
           if (formPassword.trim()) {
@@ -268,11 +308,15 @@ export function Sub2APIConnections() {
           password: authMode === "password" ? formPassword.trim() : "",
           api_key: authMode === "api_key" ? formApiKey.trim() : "",
           group_id: formGroupId.trim(),
+          totp_secret: formTotpSecret.trim(),
+          auto_sync_enabled: formAutoSync,
+          sync_interval_minutes: formSyncInterval,
         });
         setServers(data.servers);
         toast.success("连接已添加");
       }
       setDialogOpen(false);
+      setFormTotpSecret("");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "保存失败");
     } finally {
@@ -293,22 +337,54 @@ export function Sub2APIConnections() {
     }
   };
 
+  const openAccountBrowser = (server: Sub2APIServer, items: Sub2APIRemoteAccount[]) => {
+    const accounts = normalizeAccounts(items);
+    setBrowserServer(server);
+    setRemoteAccounts(accounts);
+    setSelectedIds([]);
+    setAccountQuery("");
+    setAccountPage(1);
+    setImportStepUpCode("");
+    setBrowserOpen(true);
+    toast.success(`读取成功，共 ${accounts.length} 个 OpenAI 账号`);
+  };
+
   const handleBrowseAccounts = async (server: Sub2APIServer) => {
     setLoadingAccountsId(server.id);
     try {
-      const data = await fetchSub2APIServerAccounts(server.id);
-      const accounts = normalizeAccounts(data.accounts);
-      setBrowserServer(server);
-      setRemoteAccounts(accounts);
-      setSelectedIds([]);
-      setAccountQuery("");
-      setAccountPage(1);
-      setBrowserOpen(true);
-      toast.success(`读取成功，共 ${accounts.length} 个 OpenAI 账号`);
+      // 远端会话仅保存在服务端内存中；同步必须先登录，不能直接请求账号列表。
+      const data = await syncSub2APIServer(server.id);
+      if (data.status === "login_2fa_required") {
+        setLoginServer(server);
+        setLoginEmail(data.user_email_masked || server.email);
+        setLoginCode("");
+        setLoginOpen(true);
+        return;
+      }
+      openAccountBrowser(server, data.accounts);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "读取 Sub2API 账号失败");
     } finally {
       setLoadingAccountsId(null);
+    }
+  };
+
+  const handleCompleteLogin = async () => {
+    if (!loginServer || !/^\d{6}$/.test(loginCode)) {
+      toast.error("请输入六位数字验证码");
+      return;
+    }
+    setIsVerifyingLogin(true);
+    try {
+      const data = await completeSub2APILogin(loginServer.id, loginCode);
+      setLoginCode("");
+      setLoginOpen(false);
+      openAccountBrowser(loginServer, data.accounts);
+    } catch (error) {
+      setLoginCode("");
+      toast.error(error instanceof Error ? error.message : "二次验证失败，请重试");
+    } finally {
+      setIsVerifyingLogin(false);
     }
   };
 
@@ -365,10 +441,15 @@ export function Sub2APIConnections() {
       toast.error("请先选择要导入的账号");
       return;
     }
+    // 登录验证只允许浏览；导出完整凭据还需独立验证，由用户再次提供当前验证码。
+    if (!browserServer.has_api_key && !browserServer.has_totp_secret && !/^\d{6}$/.test(importStepUpCode)) {
+      toast.error("请输入六位数字的导入二次验证码");
+      return;
+    }
 
     setIsStartingImport(true);
     try {
-      const result = await startSub2APIImport(browserServer.id, selectedIds);
+      const result = await startSub2APIImport(browserServer.id, selectedIds, importStepUpCode);
       setServers((prev) =>
         prev.map((server) =>
           server.id === browserServer.id ? { ...server, import_job: result.import_job } : server,
@@ -379,6 +460,7 @@ export function Sub2APIConnections() {
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "启动导入失败");
     } finally {
+      setImportStepUpCode("");
       setIsStartingImport(false);
     }
   };
@@ -487,6 +569,12 @@ export function Sub2APIConnections() {
                       </Button>
                     </div>
 
+                    <div className="text-xs leading-6 text-muted-foreground">
+                      {server.auto_sync_enabled ? `自动同步已开启 · 每 ${server.sync_interval_minutes || 5} 分钟 · 分组 ${server.group_id || "全部"}` : "自动同步未开启"}
+                      {server.last_sync_at ? ` · 上次 ${new Date(server.last_sync_at).toLocaleString("zh-CN")} · ${server.sync_count || 0} 个账号` : ""}
+                      {server.last_sync_error ? <p className="text-destructive">同步未完成：{syncErrorLabels[server.last_sync_error] || server.last_sync_error}</p> : null}
+                    </div>
+
                     {importJob ? (
                       <div className="space-y-3 rounded-xl border border-border bg-field px-4 py-3">
                         {(() => {
@@ -546,15 +634,15 @@ export function Sub2APIConnections() {
             <ul className="mt-1 list-inside list-disc space-y-0.5">
               <li>输入 Sub2API 地址和管理员账户（或 Admin API Key），保存为一个连接。</li>
               <li>点击某个连接的「同步」会拉取其中 platform=openai 且 type=oauth 的账号列表。</li>
-              <li>勾选需要的账号后后端会并发拉取 access_token，自动导入本地号池并刷新状态。</li>
-              <li>仅会读取 sub2api 凭据中的 access_token；refresh_token 等字段不会写入本地。</li>
+              <li>配置管理员 2FA 密钥后，服务器会自动完成登录和导出验证；也可临时输入六位验证码。</li>
+              <li>本地只保存账号 access_token，由 Sub2API 统一续期；自动同步会更新当前分组已有账号并导入新增账号。</li>
             </ul>
           </div>
         </CardContent>
       </Card>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent showCloseButton={false}>
+        <DialogContent showCloseButton={false} className="max-h-[90vh] overflow-y-auto">
           <DialogHeader className="gap-2">
             <DialogTitle>{editingServer ? "编辑连接" : "添加连接"}</DialogTitle>
             <DialogDescription className="text-sm leading-6">
@@ -583,7 +671,10 @@ export function Sub2APIConnections() {
             </div>
             <div className="space-y-2">
               <label className="text-[13px] font-medium text-foreground/80">认证方式</label>
-              <Select value={authMode} onValueChange={(value) => setAuthMode(value as AuthMode)}>
+              <Select value={authMode} onValueChange={(value) => {
+                setAuthMode(value as AuthMode);
+                if (value === "api_key") {setFormAutoSync(false); setFormTotpSecret(""); setFormClearTotp(true);}
+              }}>
                 <SelectTrigger>
                   <SelectValue />
                 </SelectTrigger>
@@ -595,6 +686,24 @@ export function Sub2APIConnections() {
             </div>
             {authMode === "password" ? (
               <>
+                <div className="space-y-2">
+                  <label htmlFor="sub2api-totp-secret" className="text-[13px] font-medium text-foreground/80">管理员 2FA 密钥</label>
+                  <Input id="sub2api-totp-secret" type="password" autoComplete="off" maxLength={2048}
+                    value={formTotpSecret} onChange={(event) => {setFormTotpSecret(event.target.value); setFormClearTotp(false);}}
+                    placeholder={editingServer?.has_totp_secret && !formClearTotp ? "已配置，留空保留" : "填写 TOTP 密钥或 otpauth 链接"} />
+                  <p className="text-xs text-muted-foreground">填写验证器的长期密钥，不是六位验证码。服务器加密保存，页面不回显。</p>
+                  {editingServer?.has_totp_secret ? <Button type="button" variant="outline" size="sm"
+                    onClick={() => {setFormClearTotp(true); setFormTotpSecret(""); setFormAutoSync(false);}}>
+                    {formClearTotp ? "保存后清除密钥" : "清除已保存密钥"}
+                  </Button> : null}
+                  <label className="flex items-center gap-2 text-sm">
+                    <Checkbox checked={formAutoSync} onCheckedChange={(value) => setFormAutoSync(Boolean(value))} />
+                    定时同步当前分组的账号和最新 AT
+                  </label>
+                  <label htmlFor="sub2api-sync-interval" className="text-xs text-muted-foreground">同步间隔（分钟）</label>
+                  <Input id="sub2api-sync-interval" type="number" min={1} max={1440} value={formSyncInterval}
+                    onChange={(event) => setFormSyncInterval(Number(event.target.value))} />
+                </div>
                 <div className="space-y-2">
                   <label className="flex items-center gap-1.5 text-[13px] font-medium text-foreground/80">
                     <Mail className="size-3.5" />
@@ -727,7 +836,52 @@ export function Sub2APIConnections() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={browserOpen} onOpenChange={setBrowserOpen}>
+      <Dialog open={loginOpen} onOpenChange={(open) => {
+        if (isVerifyingLogin) return;
+        setLoginOpen(open);
+        if (!open) {
+          setLoginCode("");
+          setLoginServer(null);
+        }
+      }}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Sub2API 二次验证</DialogTitle>
+            <DialogDescription>
+              {loginEmail} 已通过密码验证，请输入验证器中的六位验证码以继续同步。
+            </DialogDescription>
+          </DialogHeader>
+          <form onSubmit={(event) => {
+            event.preventDefault();
+            if (!isVerifyingLogin) void handleCompleteLogin();
+          }}>
+            <Input
+              aria-label="二次验证码"
+              autoFocus
+              autoComplete="one-time-code"
+              inputMode="numeric"
+              pattern="[0-9]{6}"
+              maxLength={6}
+              placeholder="六位验证码"
+              value={loginCode}
+              disabled={isVerifyingLogin}
+              onChange={(event) => setLoginCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+            />
+            <DialogFooter className="pt-4">
+              <Button type="submit" disabled={isVerifyingLogin || !/^\d{6}$/.test(loginCode)}>
+                {isVerifyingLogin ? <LoaderCircle className="size-4 animate-spin" /> : null}
+                验证并同步
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={browserOpen} onOpenChange={(open) => {
+        if (isStartingImport) return;
+        setBrowserOpen(open);
+        if (!open) setImportStepUpCode("");
+      }}>
         <DialogContent showCloseButton={false} className="flex max-h-[85vh] max-w-5xl flex-col overflow-hidden">
           <DialogHeader className="shrink-0 gap-2">
             <DialogTitle>选择要导入的账号</DialogTitle>
@@ -806,7 +960,7 @@ export function Sub2APIConnections() {
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-2">
                             <span className="truncate text-sm font-medium text-foreground/80">
-                              {item.email || item.name || item.id}
+                              {item.name || item.email || item.id}
                             </span>
                             {item.plan_type ? (
                               <Badge variant="secondary">{item.plan_type}</Badge>
@@ -858,17 +1012,46 @@ export function Sub2APIConnections() {
             </div>
           </div>
 
+          {browserServer?.has_totp_secret ? <p className="text-xs text-muted-foreground">已配置自动二次验证，服务器会完成凭据导出验证，本地仅保存 AT。</p> : null}
+          {browserServer && !browserServer.has_api_key && !browserServer.has_totp_secret ? (
+            <div className="shrink-0 space-y-2 rounded-xl border border-border bg-field p-3">
+              <label htmlFor="sub2api-import-step-up" className="text-sm font-medium">
+                导入二次验证码
+              </label>
+              <Input
+                id="sub2api-import-step-up"
+                className="max-w-xs"
+                type="password"
+                autoComplete="one-time-code"
+                inputMode="numeric"
+                pattern="[0-9]{6}"
+                maxLength={6}
+                placeholder="验证器中的六位验证码"
+                value={importStepUpCode}
+                disabled={isStartingImport}
+                onChange={(event) => setImportStepUpCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                aria-describedby="sub2api-import-step-up-help"
+              />
+              <p id="sub2api-import-step-up-help" className="text-xs text-muted-foreground">
+                导出账号凭据需要再次验证。若刚使用过当前验证码，请等待下一组再导入。
+              </p>
+            </div>
+          ) : null}
+
           <DialogFooter className="shrink-0 pt-2">
             <Button
               variant="secondary"
-              onClick={() => setBrowserOpen(false)}
+              onClick={() => {
+                setBrowserOpen(false);
+                setImportStepUpCode("");
+              }}
               disabled={isStartingImport}
             >
               取消
             </Button>
             <Button
               onClick={() => void handleStartImport()}
-              disabled={isStartingImport || selectedIds.length === 0}
+              disabled={isStartingImport || selectedIds.length === 0 || (!browserServer?.has_api_key && !browserServer?.has_totp_secret && !/^\d{6}$/.test(importStepUpCode))}
             >
               {isStartingImport ? <LoaderCircle className="size-4 animate-spin" /> : <Import className="size-4" />}
               导入选中账号

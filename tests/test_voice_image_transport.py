@@ -8,7 +8,7 @@ import threading
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-admin-key")
 
@@ -606,7 +606,7 @@ class VoiceBackendIntegrationTests(unittest.TestCase):
                         generate.return_value = iter([output])
                         self.assertEqual([output], conversation._generate_single_image_impl(request, 1, 1))
                 self.assertEqual([call.voice_close(), call.http_close(),
-                                  call.release("synthetic-account-token", not failed)], lifecycle.mock_calls)
+                                  call.release("synthetic-account-token", not failed, generation_id=ANY, not_consumed=False)], lifecycle.mock_calls)
 
 
 class VoiceDeltaTests(unittest.TestCase):

@@ -111,7 +111,7 @@ class VoiceFinalImageTests(unittest.TestCase):
         backend = FinalImageTests().backend([*[json.dumps(e) for e in events], "[DONE]"])
         with patch("services.protocol.conversation.save_image_bytes", return_value="https://example.test/final.png"):
             outputs = list(stream_image_outputs(backend, ConversationRequest(
-                model="gpt-image-2.5", prompt="测试", response_format="url")))
+                model="gpt-image-2.5", prompt="测试", response_format="url", image_transport="voice")))
         self.assertEqual("result", outputs[-1].kind)
         backend.download_final_sandbox_images.assert_called_once_with(
             "fixture-conversation", "artifact", ["/mnt/data/final.png"])

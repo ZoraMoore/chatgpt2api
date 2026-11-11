@@ -13,6 +13,29 @@ SANDBOX_IMAGE_RE = re.compile(
 )
 
 
+def is_image_generation_failure(message: object) -> bool:
+    """将图片工具的明确技术错误作为状态数据，绝不执行其中的重试指令。"""
+    if not isinstance(message, dict) or message.get("status") != "finished_successfully":
+        return False
+    author, content = message.get("author"), message.get("content")
+    if not isinstance(author, dict) or not isinstance(content, dict):
+        return False
+    name = author.get("name")
+    if (author.get("role") != "tool" or not isinstance(name, str)
+            or re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", name) is None
+            or name in {"python", "container", "open_image"}
+            or name.startswith(("python.", "container.")) or name.endswith(".open_image")
+            or content.get("content_type") != "text"):
+        return False
+    parts = content.get("parts")
+    if (not isinstance(parts, list) or not 0 < len(parts) <= 16
+            or any(not isinstance(part, str) for part in parts)
+            or sum(map(len, parts)) > 65536):
+        return False
+    # 图片工具名称会动态变化，匹配受限的协议错误前缀，不猜测工具别名。
+    return "".join(parts).lstrip().startswith("We experienced an error when generating images.")
+
+
 def validated_sandbox_image_path(value: str) -> str:
     if not isinstance(value, str) or len(value) > 2048:
         raise ValueError("invalid sandbox image path")
@@ -32,6 +55,7 @@ class FinalImageTracker:
         self.current: dict = {}
         self.final: dict = {}
         self.generated = False
+        self.image_generation_failed = False
         self.postprocessing = False
         self.stream_complete = False
         self.skipped_mainline = False
@@ -85,7 +109,7 @@ class FinalImageTracker:
             self._patch_operation = ""
             self._batch_path = ""
             self._batch_operation = ""
-            self.stream_complete = False
+            self.stream_complete = event.get("type") == "message_stream_complete"
             self.voice_turn_complete = False
             self._observe()
             return
@@ -124,6 +148,8 @@ class FinalImageTracker:
         author = message.get("author")
         author = author if isinstance(author, dict) else {}
         role = author.get("role")
+        if role == "user":
+            self.image_generation_failed = False
         content = message.get("content")
         content = content if isinstance(content, dict) else {}
         metadata = message.get("metadata")
@@ -155,10 +181,21 @@ class FinalImageTracker:
         parts = parts if isinstance(parts, list) else []
         code_tools = {"container.exec", "python"}
         inspection_tools = code_tools | {"container.open_image"}
+        if is_image_generation_failure(message):
+            self.image_generation_failed = True
+            # 失败前的代码产物不能替代本次失败；只有后续执行才能重新证明完成修正。
+            self.code_tool_after_image = False
         if (role == "tool" and isinstance(tool, (str, type(None))) and tool not in inspection_tools
                 and content.get("content_type") != "execution_output"
                 and any(isinstance(p, dict) and p.get("content_type") == "image_asset_pointer" for p in parts)):
             self.generated = True
+            # 复用最终产物的完整成功判定，避免错误或未完成图片清除本轮失败。
+            # 延迟导入打断路径验证模块与 tracker 的定义依赖。
+            from services.protocol.terminal_image_delivery import _successful
+            if (valid_tool and tool not in {"python", "container", "open_image"}
+                    and not tool.startswith(("python.", "container.")) and not tool.endswith(".open_image")
+                    and _successful({**message, "metadata": metadata})):
+                self.image_generation_failed = False
             message_id = str(message.get("id") or "")
             if message_id != self.last_image_message_id:
                 self.code_tool_after_image = False
@@ -217,6 +254,20 @@ class FinalImageTracker:
     def _patch(self, operation: dict) -> None:
         path = operation.get("p", "")
         op = operation.get("o")
+        if path == "/message" and op in {"append", "add", "replace"} and isinstance(operation.get("v"), dict):
+            value = copy.deepcopy(operation["v"])
+            changed_id = "id" in value and value["id"] != self.current.get("id")
+            if op == "append" and self.current and not changed_id:
+                self.current.update(value)
+            else:
+                self.current = value
+            # 根消息替换是新的快照，旧的省略路径/操作不能继续写入另一个消息。
+            if op != "append" or changed_id:
+                self._patch_path = self._patch_operation = ""
+                self._batch_path = self._batch_operation = ""
+            self.stream_complete = False
+            self.voice_turn_complete = False
+            return
         if (not isinstance(path, str) or not path.startswith("/message/") or len(path) > 2048
                 or path.count("/") > 64 or not self.current or "v" not in operation
                 or not isinstance(op, str) or op not in {"append", "add", "replace"}):

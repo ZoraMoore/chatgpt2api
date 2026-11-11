@@ -24,6 +24,7 @@ export type Account = {
   access_token_expires_at?: string | null;
   has_refresh_token?: boolean;
   auto_refresh_token?: boolean;
+  refresh_owner?: "local" | "sub2api";
   image_cleanup_enabled?: boolean;
   image_cleanup_next_at?: number | null;
   image_cleanup_last_at?: number | null;
@@ -41,6 +42,15 @@ export type Account = {
   source_type?: string | null;
   status: AccountStatus;
   quota: number;
+  image_priority: number;
+  image_priority_mode: "auto" | "manual";
+  image_quota_cap: number | null;
+  image_quota_used: number | null;
+  image_quota_reserved: number;
+  image_quota_uncertain: number;
+  image_quota_available: number;
+  image_quota_baseline: "known" | "unknown";
+  image_quota_reset_at: string | null;
   email?: string | null;
   user_id?: string | null;
   limits_progress?: Array<{
@@ -492,6 +502,8 @@ export async function updateAccount(
     type?: AccountType;
     status?: AccountStatus;
     quota?: number;
+    image_priority?: number;
+    image_priority_mode?: "auto" | "manual";
     proxy?: string;
     /** 代理池条目 id，必须是池里已存在的代理 */
     proxy_id?: string;
@@ -1003,6 +1015,12 @@ export type Sub2APIServer = {
   email: string;
   has_api_key: boolean;
   group_id: string;
+  has_totp_secret?: boolean;
+  auto_sync_enabled?: boolean;
+  sync_interval_minutes?: number;
+  last_sync_at?: string;
+  last_sync_error?: string;
+  sync_count?: number;
   import_job?: CPAImportJob | null;
 };
 
@@ -1037,6 +1055,9 @@ export async function createSub2APIServer(server: {
   password: string;
   api_key: string;
   group_id: string;
+  totp_secret?: string;
+  auto_sync_enabled?: boolean;
+  sync_interval_minutes?: number;
 }) {
   return httpRequest<{ server: Sub2APIServer; servers: Sub2APIServer[] }>(
     "/api/sub2api/servers",
@@ -1056,6 +1077,10 @@ export async function updateSub2APIServer(
     password?: string;
     api_key?: string;
     group_id?: string;
+    totp_secret?: string;
+    clear_totp_secret?: boolean;
+    auto_sync_enabled?: boolean;
+    sync_interval_minutes?: number;
   },
 ) {
   return httpRequest<{ server: Sub2APIServer; servers: Sub2APIServer[] }>(
@@ -1088,15 +1113,35 @@ export async function fetchSub2APIServerAccounts(serverId: string) {
   );
 }
 
+export type Sub2APISyncResult = {
+  status: "authenticated" | "login_2fa_required";
+  accounts: Sub2APIRemoteAccount[];
+  user_email_masked?: string;
+};
+
+export async function syncSub2APIServer(serverId: string) {
+  return httpRequest<Sub2APISyncResult>(`/api/sub2api/servers/${serverId}/sync`, {
+    method: "POST",
+  });
+}
+
+export async function completeSub2APILogin(serverId: string, totpCode: string) {
+  return httpRequest<Sub2APISyncResult>(`/api/sub2api/servers/${serverId}/login-2fa`, {
+    method: "POST",
+    body: { totp_code: totpCode },
+  });
+}
+
 export async function startSub2APIImport(
   serverId: string,
   accountIds: string[],
+  stepUpCode = "",
 ) {
   return httpRequest<{ import_job: CPAImportJob | null }>(
     `/api/sub2api/servers/${serverId}/import`,
     {
       method: "POST",
-      body: { account_ids: accountIds },
+      body: { account_ids: accountIds, step_up_code: stepUpCode },
     },
   );
 }

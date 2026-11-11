@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import base64
+import copy
+import hashlib
 import json
+import math
 from io import BytesIO
 import re
 import threading
+import uuid
 import time
 from concurrent.futures import as_completed
 from dataclasses import dataclass, field
@@ -12,14 +16,17 @@ from typing import Any, Iterable, Iterator
 
 import tiktoken
 from PIL import Image
+from curl_cffi.requests.exceptions import RequestException
 
 from services.account_service import account_service
-from services.image_quota import ImageQuotaExceeded, detect_message_limit, raise_image_quota
+from services.image_quota import ImageQuotaExceeded, detect_message_limit, raise_image_quota, image_quota_evidence_from_http, image_throttle_evidence_from_http, image_readback_throttle_evidence_from_http
 from services.config import config
 from services.image_execution import image_work_pool
 from services.image_storage_service import image_storage_service
 from services.protocol.final_image import FinalImageTracker
-from services.protocol.terminal_image_delivery import select_terminal_image_delivery
+from services.protocol.terminal_image_delivery import select_terminal_image_delivery, final_delivery_rejected, _branch, _failed
+from services.protocol.image_delivery import (ImageDeliveryEvidence, bind_input_assets, delivery_context, scope_turn,
+    make_completion_receipt, observed_evidence, observed_snapshot_reason, merge_observed_evidence)
 from services.openai_backend_api import (
     ImageContentPolicyError,
     ImageGenerationTimeoutError,
@@ -32,6 +39,7 @@ from utils.helper import (
     is_codex_image_model,
     is_firefly_image_model,
     is_supported_image_model,
+    resolve_image_transport,
     split_image_model,
 )
 from utils.image_tokens import count_image_content_tokens
@@ -50,6 +58,7 @@ class ImageGenerationError(Exception):
         conversation_id: str = "",
         image_execution: list[dict[str, Any]] | None = None,
         restore_at: str = "",
+        delivery_context: dict | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -60,6 +69,7 @@ class ImageGenerationError(Exception):
         self.conversation_id = conversation_id
         self.image_execution = image_execution or []
         self.restore_at = restore_at
+        self.delivery_context = delivery_context or {}
 
     def to_openai_error(self) -> dict[str, Any]:
         error_dict = {
@@ -74,15 +84,19 @@ class ImageGenerationError(Exception):
             error_dict["error"]["account_email"] = self.account_email
         if self.restore_at:
             error_dict["error"]["restore_at"] = self.restore_at
+        task_id = getattr(self, "recovery_task_id", "")
+        if isinstance(task_id, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", task_id):
+            error_dict["error"]["task_id"] = task_id
         return error_dict
 
 
 def image_quota_error(exc: ImageQuotaExceeded) -> ImageGenerationError:
     from datetime import datetime, timezone
-    restore = datetime.fromtimestamp(exc.restore_at, timezone.utc).isoformat()
-    return ImageGenerationError(str(exc), status_code=429, error_type="rate_limit_error", code="image_quota_exceeded",
+    restore = datetime.fromtimestamp(exc.restore_at, timezone.utc).isoformat() if exc.restore_at is not None else ""
+    return ImageGenerationError(str(exc), status_code=429, error_type="rate_limit_error", code="image_request_rate_limited" if exc.record.get("source") in {"upstream_http_image_throttle", "upstream_http_conversation_throttle"} else "image_quota_exceeded",
         conversation_id=exc.conversation_id, restore_at=restore, image_execution=[{"image_quota_limit": {
-            "source": exc.record.get("source"), "occurred_at": exc.record.get("occurred_at"), "restore_at": restore}}])
+            "source": exc.record.get("source"), "occurred_at": exc.record.get("occurred_at"), "restore_at": restore,
+            **({"http_status": 429} if exc.record.get("source") == "upstream_http_conversation_throttle" else {})}}])
 
 
 def public_image_error_message(message: str) -> str:
@@ -335,8 +349,13 @@ class ConversationRequest:
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
+    delivery_checkpoint_callback: Any = None
     # 入队时捕获，确保后台切换后同一请求的多张图片仍使用相同传输。
     image_transport: str = field(default_factory=lambda: config.image_transport)
+    delivery_context: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        self.image_transport = resolve_image_transport(self.model, self.image_transport)
 
 
 @dataclass
@@ -651,37 +670,43 @@ def iter_conversation_payloads(payloads: Iterator[str], history_text: str = "",
     state = ConversationState()
     history_messages = history_messages or []
     history_index = 0
-    for payload in payloads:
-        # print(f"[upstream_sse] {payload}", flush=True)
-        if not payload:
-            continue
-        if payload == "[DONE]":
-            yield conversation_base_event("conversation.done", state, done=True)
-            break
-        try:
-            event = json.loads(payload)
-        except json.JSONDecodeError:
-            update_conversation_state(state, payload)
-            yield conversation_base_event("conversation.raw", state, payload=payload)
-            continue
-        if not isinstance(event, dict):
+    try:
+        for payload in payloads:
+            # print(f"[upstream_sse] {payload}", flush=True)
+            if not payload:
+                continue
+            if payload == "[DONE]":
+                yield conversation_base_event("conversation.done", state, done=True)
+                break
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError:
+                update_conversation_state(state, payload)
+                yield conversation_base_event("conversation.raw", state, payload=payload)
+                continue
+            if not isinstance(event, dict):
+                yield conversation_base_event("conversation.event", state, raw=event)
+                continue
+            update_conversation_state(state, payload, event)
+            if history_index < len(history_messages) and event_assistant_text(event, history_text) == history_messages[history_index]:
+                history_index += 1
+                state.raw_text = ""
+                state.text = ""
+                continue
+            next_raw_text = assistant_raw_text(event, state.raw_text, history_text)
+            next_text = sanitize_output_text(next_raw_text)
+            state.raw_text = next_raw_text
+            if next_text != state.text:
+                delta = next_text[len(state.text):] if next_text.startswith(state.text) else next_text
+                state.text = next_text
+                yield conversation_base_event("conversation.delta", state, raw=event, delta=delta)
+                continue
             yield conversation_base_event("conversation.event", state, raw=event)
-            continue
-        update_conversation_state(state, payload, event)
-        if history_index < len(history_messages) and event_assistant_text(event, history_text) == history_messages[history_index]:
-            history_index += 1
-            state.raw_text = ""
-            state.text = ""
-            continue
-        next_raw_text = assistant_raw_text(event, state.raw_text, history_text)
-        next_text = sanitize_output_text(next_raw_text)
-        state.raw_text = next_raw_text
-        if next_text != state.text:
-            delta = next_text[len(state.text):] if next_text.startswith(state.text) else next_text
-            state.text = next_text
-            yield conversation_base_event("conversation.delta", state, raw=event, delta=delta)
-            continue
-        yield conversation_base_event("conversation.event", state, raw=event)
+    finally:
+        # 普通 for 不会向上游传递 close；DONE、异常和消费者早退都须释放连接。
+        close = getattr(payloads, "close", None)
+        if callable(close):
+            close()
 
 
 def conversation_events(
@@ -833,6 +858,312 @@ def _remove_image_conversation_later(backend: OpenAIBackendAPI, conversation_id:
     threading.Thread(target=_run, name=f"remove-image-conversation-{conversation_id}", daemon=True).start()
 
 
+def _read_final_image_snapshot(backend, conversation_id, submitted_id, observed, required_tool_calls):
+    """SSE已结束时，给原会话终态短暂落库时间；不能重发生成或交付旧图。"""
+    from services.image_generation_stream import _completed_messages
+    from curl_cffi.requests.exceptions import RequestException
+
+    started = time.monotonic()
+    deadline = started + 8.0
+    retryable = {'document_in_progress', 'final_incomplete', 'tool_incomplete',
+                 'observed_tools_missing', 'calls_missing'}
+    attempt = 0
+    document = None
+    last_error = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if document is None:
+                if last_error is not None:
+                    raise last_error
+                raise TimeoutError('final image snapshot confirmation timed out')
+            return document
+        attempt += 1
+        try:
+            document = backend._get_conversation(conversation_id, timeout_secs=min(3.0, remaining))
+            last_error = None
+        except RequestException as exc:
+            # 这里只重试同一会话的幂等GET；短暂传输故障也必须受同一个8秒预算约束。
+            if getattr(exc, 'code', None) not in {7, 18, 28, 52, 56}:
+                raise
+            last_error = exc
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            if attempt == 1:
+                logger.info({'event': 'image_final_snapshot_pending', 'conversation_id': conversation_id,
+                             'reason': 'transport_error', 'exception_code': getattr(exc, 'code', None)})
+            time.sleep(min(0.5, remaining))
+            continue
+        diagnostic = {}
+        complete = _completed_messages(
+            document, conversation_id, submitted_id, observed=observed,
+            required_tool_calls=required_tool_calls, diagnostic=diagnostic,
+        )
+        if complete is not None:
+            if attempt > 1:
+                logger.info({'event': 'image_final_snapshot_settled', 'conversation_id': conversation_id,
+                             'attempts': attempt, 'duration_ms': round((time.monotonic() - started) * 1000)})
+            return document
+        if diagnostic.get('reason') not in retryable:
+            return document
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return document
+        if attempt == 1:
+            logger.info({'event': 'image_final_snapshot_pending', 'conversation_id': conversation_id,
+                         'reason': diagnostic.get('reason')})
+        time.sleep(min(0.5, remaining))
+
+
+def _delivery_checkpoint(backend, request, context, conversation_id, index, total, *, phase="pending", data=None, reason=""):
+    callback = request.delivery_checkpoint_callback
+    if not callable(callback):
+        return
+    event = {"phase": phase, "index": index, "total": total, "conversation_id": conversation_id,
+             "resume_account_ref": getattr(backend, "_image_resume_account_ref", ""),
+             "delivery_context": copy.deepcopy(context), "reason": reason}
+    if data is not None:
+        event["data"] = data
+    task_id = callback(event)
+    if isinstance(task_id, str):
+        backend._image_recovery_task_id = task_id
+    backend._image_checkpoint_context = copy.deepcopy(context)
+    if phase in {"success", "error"}:
+        backend._image_recovery_finished = True
+
+
+def _deliver_conversation_final(backend, request, tracker, evidence, conversation_id, index, total,
+                                *, document=None, observed_calls=None, resume=False, has_reference=False,
+                                readback_deadline=None, readback_attempts=0, allow_terminal_recovery=True,
+                                recovery_window=8.0, source_error_type=""):
+    """统一完成判定、原会话确认和唯一产物交付；生成POST始终不重放。"""
+    context = delivery_context(backend, request)
+    observed_calls = observed_calls or {}
+    known_tools = tuple(tracker._seen_tool_messages)
+    info = {}
+    attempts = readback_attempts
+
+    def fail(message, code="image_final_unconfirmed", *, status_code=502, error_type="server_error"):
+        reason = info.get("reason") or code
+        if reason == "ready":
+            reason = code
+        binding_details = {k: info[k] for k in ("submission_hash", "observed_submission_hash", "attachments_type", "input_pointer_invalid") if k in info}
+        summary = tracker.execution_summary("unavailable")
+        summary.update({"selection_reason": reason, "requested_n": 1, "returned_n": 0,
+                        "readback_attempts": attempts, "completion_marker": bool(evidence.completed_final_id()),
+                        "candidate_count": info.get("candidate_count", 0), "tool_count": info.get("tool_count", 0),
+                        "readback_error_type": info.get("error_type", ""), "source_error_type": source_error_type,
+                        "binding_details": binding_details})
+        logger.info({"event": "image_delivery_rejected", "conversation_id": conversation_id,
+                     "reason": reason, "readback_attempts": attempts,
+                     "completion_marker": bool(evidence.completed_final_id()),
+                     "tool_count": info.get("tool_count", 0), "candidate_count": info.get("candidate_count", 0),
+                     "error_type": info.get("error_type", ""), "binding_details": binding_details})
+        if getattr(backend, "_image_recovery_started", False) is True:
+            _delivery_checkpoint(backend, request, context, conversation_id, index, total, phase="error", reason=reason)
+        error = ImageGenerationError(message, status_code=status_code, error_type=error_type,
+                                     code=code, conversation_id=conversation_id,
+                                     image_execution=[summary], delivery_context=context)
+        error.recovery_task_id = getattr(backend, "_image_recovery_task_id", "")
+        raise error
+
+    if not resume and not context:
+        info["reason"] = "submission_identity_missing"
+        fail("无法确认本次生成的提交身份，未返回图片。")
+    if evidence.invalid:
+        info["reason"] = "invalid_stream_evidence"
+        fail("图片会话证据无效或超出限制，未返回图片。")
+    bind_info = {}
+    candidate = (bind_input_assets(document, context, diagnostic=bind_info) if document is not None
+                 else evidence.document(conversation_id, context, diagnostic=bind_info))
+    if (not resume and document is None and bind_info.get("reason") == "submission_mismatch"
+            and context.get("submitted_message_id") and evidence.conversation_id == conversation_id):
+        # 直播可能含未落库的临时user消息；原提交身份不能被覆盖，先GET原会话核验。
+        bind_info["reason"] = "stream_submission_unconfirmed"
+
+    def choose(value, *, snapshot=False, binding=None):
+        info.clear()
+        # 空候选或输入结构错误不再伪装成会话冲突；真实外部CID仍先拒绝。
+        ids = [value[k] for k in ("id", "conversation_id") if isinstance(value, dict) and k in value]
+        if ids and any(cid != conversation_id for cid in ids):
+            info["reason"] = "conversation_mismatch"
+            return None
+        if binding and binding.get("reason"):
+            info.update(binding)
+            return None
+        reason = observed_snapshot_reason(value, context)
+        if reason:
+            info["reason"] = reason
+            return None
+        if snapshot:
+            reason = evidence.snapshot_reason(value, context)
+            if reason:
+                info["reason"] = reason
+                return None
+        return select_terminal_image_delivery(
+            value, conversation_id=conversation_id,
+            submitted_message_id=context.get("submitted_message_id", ""),
+            required_tool_message_ids=known_tools, required_tool_calls=observed_calls,
+            completed_final_message_id=evidence.completed_final_id() if not tracker.review_requested else "",
+            completion_receipt=context.get("completion_receipt"), diagnostic=info)
+
+    selected = choose(candidate, binding=bind_info) if resume or tracker.stream_complete or source_error_type else None
+    if selected is None and not info:
+        info["reason"] = "completion_missing"
+    recoverable = {"completion_missing", "document_in_progress", "tool_incomplete", "calls_pending",
+                   "artifact_missing", "generation_pending", "invalid_branch", "observed_tools_missing",
+                   "observed_calls_missing", "snapshot_messages_missing", "snapshot_asset_changed",
+                   "snapshot_final_regressed", "snapshot_regressed_failure", "readback_unavailable",
+                   "input_assets_invalid", "missing_submission", "stream_submission_unconfirmed"}
+    if selected is None and info.get("reason") in recoverable and context and (known_tools or source_error_type):
+        # 续查回放还未通过核验时，不能用它覆盖此前保存的资产身份。
+        if not resume or (not bind_info and not observed_snapshot_reason(candidate, context)):
+            seen = observed_evidence(evidence.messages.values(), conversation_id)
+            context["observed_evidence"] = merge_observed_evidence(context.get("observed_evidence"), seen)
+        if "observed_evidence" in context:
+            backend._image_observed_evidence = context["observed_evidence"]
+        backend._image_recovery_started = True
+        _delivery_checkpoint(backend, request, context, conversation_id, index, total, reason=info.get("reason", ""))
+        if request.progress_callback:
+            request.progress_callback("confirming_image")
+    now = time.monotonic()
+    deadline = now + recovery_window
+    supplied = readback_deadline if readback_deadline is not None else getattr(backend, "_image_delivery_deadline", None)
+    if type(supplied) in (int, float) and math.isfinite(supplied):
+        deadline = min(deadline, supplied)
+    while (allow_terminal_recovery and selected is None and info.get("reason") in recoverable
+           and attempts < (40 if recovery_window > 8 else 4) and conversation_id):
+        readback_limit = getattr(backend, "_image_readback_limit_error", None)
+        if isinstance(readback_limit, ImageQuotaExceeded):
+            # 原SSE最终仍无可交付图片；保留已登记的429，不能重新轰击读取接口。
+            raise readback_limit
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.05:
+            break
+        if attempts:
+            delay = min(5.0 if recovery_window > 8 else (0.5, 1.0, 2.0)[attempts - 1], remaining)
+            if delay > 0:
+                time.sleep(delay)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.05:
+                break
+        attempts += 1
+        try:
+            snapshot = backend._get_conversation(conversation_id, timeout_secs=min(5.0 if recovery_window > 8 else 3.0, remaining))
+        except ImageQuotaExceeded:
+            raise
+        except Exception as exc:
+            # 网络/上游读回异常可以重查；选择器和证据代码错误必须原样暴露，不能伪装成等待。
+            throttle_evidence = image_readback_throttle_evidence_from_http(exc)
+            if throttle_evidence is not None:
+                raise_image_quota(backend, throttle_evidence)
+            info.clear()
+            info.update(reason="readback_unavailable", error_type=type(exc).__name__)
+            status = getattr(exc, "status_code", None)
+            if type(status) is int and 100 <= status <= 599:
+                info["http_status"] = status
+        else:
+            candidate = bind_input_assets(snapshot, context, diagnostic=bind_info)
+            if not bind_info:
+                candidate = evidence.reconcile_snapshot(candidate, context)
+            selected = choose(candidate, snapshot=True, binding=bind_info)
+            if (getattr(backend, "_image_recovery_started", False) is True and not bind_info
+                    and info.get("reason") in recoverable | {"ready"}
+                    and not observed_snapshot_reason(candidate, context)):
+                turn = scope_turn(candidate, context.get("submitted_message_id", ""))
+                if turn:
+                    latest = merge_observed_evidence(context.get("observed_evidence"), observed_evidence(turn, conversation_id))
+                    if latest != context.get("observed_evidence"):
+                        context["observed_evidence"] = latest
+                        backend._image_observed_evidence = latest
+                        _delivery_checkpoint(backend, request, context, conversation_id, index, total, reason=info.get("reason", ""))
+        logger.info({"event": "image_delivery_readback", "conversation_id": conversation_id,
+                     "attempt": attempts, "reason": info.get("reason"), "ready": selected is not None,
+                     "error_type": info.get("error_type", ""), "http_status": info.get("http_status")})
+    if selected is None:
+        reason = info.get("reason", "completion_missing")
+        if reason == "content_policy_rejected":
+            fail("上游因内容政策拒绝了本次图片生成，请调整提示词后重试。", "content_policy_violation",
+                 status_code=400, error_type="invalid_request_error")
+        if reason == "quality_rejected":
+            fail("上游明确表示本次图片未满足要求，未交付合格的最终图片。", "image_quality_rejected")
+        if reason in {"last_tool_failed", "generation_failed"}:
+            fail("上游图片生成或后处理失败，未返回较早版本。", "image_generation_failed")
+        if reason == "input_asset_selected":
+            fail("上游选择了输入参考原图，未交付新的最终图片。", "image_input_returned")
+        if reason.startswith("ambiguous_") or reason == "unbound_final_asset":
+            fail("无法确定本轮唯一最终图片，未自动选取候选图。", "image_final_ambiguous")
+        if reason == "no_image_generated":
+            fail("上游本轮已结束，但未生成可交付的图片。", "no_image_generated")
+        if reason in recoverable or reason == "postprocess_artifact_unconfirmed":
+            fail("本轮尚未完整交付可确认的最终图片，可继续查询原会话；未返回参考原图或中间图片。", "image_delivery_pending")
+        fail("无法核对本轮图片交付证据，请根据请求编号查询具体原因。", "image_delivery_invalid")
+    receipt = make_completion_receipt(candidate, context.get("submitted_message_id", ""), selected)
+    if receipt:
+        backend._image_completion_receipt = receipt
+        context["completion_receipt"] = receipt
+    if getattr(backend, "_image_recovery_started", False) is True:
+        _delivery_checkpoint(backend, request, context, conversation_id, index, total, reason="artifact_selected")
+    branch = _branch(candidate) or []
+    tools = [m for m in branch if m["author"]["role"] == "tool"]
+    if request.progress_callback:
+        request.progress_callback("receiving_image")
+    try:
+        if getattr(backend, "_image_auto_recovery", False) is True:
+            backend._image_download_deadline = time.monotonic() + 30.0
+            auto_deadline = getattr(backend, "_image_auto_deadline", None)
+            if type(auto_deadline) in (int, float) and math.isfinite(auto_deadline):
+                backend._image_download_deadline = min(backend._image_download_deadline, auto_deadline)
+        if selected.kind == "native_image":
+            if has_reference and config.image_require_reference_postprocess:
+                fail("上游尚未完成要求的参考图后处理，未返回初始图片。", "image_final_unconfirmed")
+            # 已选中的唯一结构化pointer只解析一次，下载器不得重新扫描全部候选。
+            pointer = selected.image_message["content"]["parts"][0]["asset_pointer"]
+            scheme, asset = pointer.split("://", 1)
+            urls = backend._resolve_image_urls(
+                conversation_id, [asset] if scheme == "file-service" else [],
+                [asset] if scheme == "sediment" else [])
+            if not isinstance(urls, list) or not urls:
+                fail("最终图片下载地址缺失，未回退到其他图片。", "image_final_download_failed")
+            images = backend.download_image_bytes(urls)
+        else:
+            images = backend.download_final_sandbox_images(conversation_id, selected.message_id, [selected.path])
+        if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], bytes) or not 0 < len(images[0]) <= 50 * 1024 * 1024:
+            fail("最终图片数量或内容无效，未返回候选图片。", "image_final_ambiguous")
+        if hashlib.sha256(images[0]).hexdigest() in context.get("input_image_hashes", []):
+            fail("上游返回了输入参考原图，未交付新的最终图片。", "image_input_returned")
+        with Image.open(BytesIO(images[0])) as picture:
+            if picture.format not in {"PNG", "JPEG", "WEBP", "GIF"}:
+                fail("最终图片格式无效。", "image_final_invalid")
+            picture.verify()
+        data = format_image_result([{"b64_json": base64.b64encode(images[0]).decode("ascii")}],
+                                   request.prompt, request.response_format, request.base_url, int(time.time()))["data"]
+    except (ImageGenerationError, ImageQuotaExceeded):
+        raise
+    except Exception as exc:
+        try:
+            fail("最终修正版图片下载失败或校验失败，未返回参考原图或中间图片。", "image_final_download_failed")
+        except ImageGenerationError as error:
+            raise error from exc
+    source = {"native_image": "image_tool_terminal", "sandbox_final": "sandbox",
+              "python_output": "python_terminal", "container_output": "container_terminal"}[selected.kind]
+    summary = tracker.execution_summary(source)
+    summary.update({"selection_reason": "unique_terminal_artifact", "selected_message_id": selected.message_id,
+                    "observed_tool_results": len(tools), "requested_n": 1, "returned_n": len(data),
+                    "excluded_input_assets": len(context.get("input_asset_ids", [])),
+                    "completion_source": info.get("completion_source"), "readback_attempts": attempts,
+                    "source_error_type": source_error_type})
+    logger.info({"event": "image_final_selected", "conversation_id": conversation_id,
+                 "selected_message_id": selected.message_id, "source": selected.kind,
+                 "requested_n": 1, "returned_n": len(data), "observed_tool_results": len(tools)})
+    if getattr(backend, "_image_recovery_started", False) is True:
+        _delivery_checkpoint(backend, request, context, conversation_id, index, total, phase="success", data=data)
+    _remove_image_conversation_later(backend, conversation_id)
+    yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data,
+                      conversation_id=conversation_id, execution=summary)
+
+
 def stream_image_outputs(
         backend: OpenAIBackendAPI,
         request: ConversationRequest,
@@ -850,20 +1181,39 @@ def stream_image_outputs(
     backend._image_quota_prompt = request.prompt
     last: dict[str, Any] = {}
     final_images = FinalImageTracker()
+    delivery_evidence = ImageDeliveryEvidence()
     delivery_document = None
+    initial_readback_attempts = 0
     observed_tool_calls: dict[str, str] = {}
     bound_probe_conversation = ""
     terminal_observation_safe = True
     has_reference = bool(request.images) or resume_has_reference
+    # 主站普通会话新请求在流结束后只交付现有产物；显式续查保留原有协议。
+    direct_result_only = request.image_transport == "conversation" and not resume_conversation_id
+    backend._image_fail_without_result_on_stream_end = direct_result_only
     if resume_conversation_id:
         # 续轮询只读取原会话，不重新发送用户消息或生成请求；共用最终产物判定。
         started = time.monotonic()
-        resume_deadline = started + (poll_timeout_secs or config.image_poll_timeout_secs)
+        resume_budget = poll_timeout_secs or config.image_poll_timeout_secs
+        if request.image_transport == "conversation":
+            resume_budget = min(120.0 if request.delivery_context.get("observed_evidence") else 8.0, resume_budget)
+        resume_deadline = started + resume_budget
+        initial_readback_attempts = int(_resume_snapshot is None)
         document = _resume_snapshot if _resume_snapshot is not None else backend._get_conversation(
-            resume_conversation_id, timeout_secs=min(60.0, poll_timeout_secs or config.image_poll_timeout_secs),
+            resume_conversation_id, timeout_secs=min(3.0 if request.image_transport == "conversation" else 60.0, resume_budget),
         )
         delivery_document = document
-        messages = document.get("messages")
+        if request.image_transport == "conversation":
+            resume_context = delivery_context(backend, request)
+            binding = {}
+            bound = bind_input_assets(document, resume_context, diagnostic=binding)
+            ids = [document[k] for k in ("id", "conversation_id") if isinstance(document, dict) and k in document]
+            # 未核验的首次快照不能先变成直播证据，否则正确的后续快照也会被当成回退。
+            invalid_snapshot = (binding or not ids or any(cid != resume_conversation_id for cid in ids)
+                                or observed_snapshot_reason(bound, resume_context))
+            messages = [] if invalid_snapshot else scope_turn(bound, resume_context.get("submitted_message_id", ""))
+        else:
+            messages = document.get("messages")
         if not isinstance(messages, list):
             messages = [(node or {}).get("message") for node in (document.get("mapping") or {}).values()]
         payloads = [json.dumps({"conversation_id": resume_conversation_id})]
@@ -881,52 +1231,79 @@ def stream_image_outputs(
             size=request.size,
             quality=request.quality,
         )
-    for event in events:
-        last = event
-        raw = event.get("raw")
-        if isinstance(raw, dict):
-            final_images.update(raw)
-            message = final_images.current
-            if final_images.conversation_id and final_images.conversation_id != bound_probe_conversation and not resume_conversation_id:
-                account_service.bind_image_probe_conversation(getattr(backend, "access_token", ""), final_images.conversation_id)
-                bound_probe_conversation = final_images.conversation_id
-            evidence = detect_message_limit(message, final_images.conversation_id or event.get("conversation_id") or "",
-                user_text=getattr(backend, "_image_quota_prompt", request.prompt), fallback_id=getattr(backend, "_image_submitted_message_id", ""))
-            if evidence is not None:
-                raise_image_quota(backend, evidence)
-            author = message.get("author") if isinstance(message.get("author"), dict) else {}
-            message_id, recipient = message.get("id"), message.get("recipient")
-            if (author.get("role") == "assistant" and isinstance(message_id, str)
-                    and isinstance(recipient, str) and recipient != "all"):
-                if (not 0 < len(message_id) <= 128 or not 0 < len(recipient) <= 128
-                        or len(observed_tool_calls) >= 4096 and message_id not in observed_tool_calls):
-                    terminal_observation_safe = False
-                else:
-                    observed_tool_calls[message_id] = recipient
-        if event.get("done"):
-            final_images.stream_complete = True
-        if event.get("type") == "conversation.delta":
-            yield ImageOutput(
-                kind="progress",
-                model=request.model,
-                index=index,
-                total=total,
-                text=str(event.get("delta") or ""),
-                upstream_event_type="conversation.delta",
-            )
-            continue
-        if event.get("type") == "conversation.event":
+    stream_error = None
+    try:
+        for event in events:
+            last = event
             raw = event.get("raw")
-            raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
-            yield ImageOutput(
-                kind="progress",
-                model=request.model,
-                index=index,
-                total=total,
-                upstream_event_type=raw_type,
-            )
+            if isinstance(raw, dict):
+                final_images.update(raw)
+                message = final_images.current
+                delivery_evidence.observe(message, final_images.conversation_id or event.get("conversation_id", ""))
+                delivery_evidence.complete(raw, message)
+                if final_images.conversation_id and final_images.conversation_id != bound_probe_conversation and not resume_conversation_id:
+                    account_service.bind_image_probe_conversation(getattr(backend, "access_token", ""), final_images.conversation_id,
+                        generation_id=getattr(backend, "_image_generation_id", None))
+                    bound_probe_conversation = final_images.conversation_id
+                evidence = detect_message_limit(message, final_images.conversation_id or event.get("conversation_id") or "",
+                    user_text=getattr(backend, "_image_quota_prompt", request.prompt), fallback_id=getattr(backend, "_image_submitted_message_id", ""))
+                if evidence is not None:
+                    raise_image_quota(backend, evidence)
+                author = message.get("author") if isinstance(message.get("author"), dict) else {}
+                message_id, recipient = message.get("id"), message.get("recipient")
+                if (author.get("role") == "assistant" and isinstance(message_id, str)
+                        and isinstance(recipient, str) and recipient != "all"):
+                    if (not 0 < len(message_id) <= 128 or not 0 < len(recipient) <= 128
+                            or len(observed_tool_calls) >= 4096 and message_id not in observed_tool_calls):
+                        terminal_observation_safe = False
+                    else:
+                        observed_tool_calls[message_id] = recipient
+            if event.get("done"):
+                final_images.stream_complete = True
+                delivery_evidence.done_received = True
+            if event.get("type") == "conversation.delta":
+                yield ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    text=str(event.get("delta") or ""),
+                    upstream_event_type="conversation.delta",
+                )
+                continue
+            if event.get("type") == "conversation.event":
+                raw = event.get("raw")
+                raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
+                yield ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    upstream_event_type=raw_type,
+                )
 
-    conversation_id = str(last.get("conversation_id") or "")
+    except (ImageGenerationTimeoutError, ImagePollTimeoutError, RequestException) as exc:
+        if request.image_transport != "conversation" or not final_images.conversation_id:
+            raise
+        # 生成已经发送；保留当前证据，只读原会话，不能让异常绕过统一交付。
+        stream_error = exc
+    finally:
+        # 额度等业务异常会中断 for；此时仍须同步关闭嵌套流，不能留到异步线程 GC。
+        close = getattr(events, "close", None)
+        if callable(close):
+            close()
+
+    conversation_id = str(last.get("conversation_id") or final_images.conversation_id or "")
+    if request.image_transport == "conversation":
+        recovery_window = 180.0 if stream_error else (resume_budget if resume_conversation_id else 8.0)
+        recovery_deadline = time.monotonic() + recovery_window if stream_error else (resume_deadline if resume_conversation_id else None)
+        yield from _deliver_conversation_final(
+            backend, request, final_images, delivery_evidence, conversation_id, index, total,
+            document=delivery_document, observed_calls=observed_tool_calls, resume=bool(resume_conversation_id),
+            has_reference=has_reference, readback_deadline=recovery_deadline, recovery_window=recovery_window,
+            source_error_type=type(stream_error).__name__ if stream_error else "",
+            readback_attempts=initial_readback_attempts, allow_terminal_recovery=allow_terminal_recovery)
+        return
     # 读回文档不能遗漏直播已经看到的工具工作，或回退到更早的一张图。
     observed_final_id = final_images.final.get("id", "")
     observed_image_id = final_images.last_image_message_id
@@ -934,6 +1311,14 @@ def stream_image_outputs(
     def final_error(message: str) -> ImageGenerationError:
         return ImageGenerationError(message, conversation_id=conversation_id,
                                     image_execution=[final_images.execution_summary("unavailable")])
+    def no_image_error() -> ImageGenerationError:
+        logger.info({"event": "image_stream_no_result", "conversation_id": conversation_id,
+                     "reason": "stream_ended_without_image", "poll_skipped": True})
+        return ImageGenerationError(
+            "生图失败：上游生成流已结束，但未返回生成图片。",
+            code="no_image_generated", conversation_id=conversation_id,
+            image_execution=[final_images.execution_summary("unavailable")],
+        )
     # 部分网页增量只给出最终链接，省略完整消息快照。仅在存在后处理信号时
     # 补读一次已存储会话，以取得 interpreter/download 必需的最终消息 ID。
     final_hint = "sandbox:/mnt/data/" in str(last.get("text") or "") or last.get("turn_use_case") == "data analysis"
@@ -941,9 +1326,21 @@ def stream_image_outputs(
         needs_snapshot = not final_images.is_complete() or not final_images.paths()
     except ValueError as exc:
         raise final_error("最终修正版图片路径无效，未返回中间图片。") from exc
+    if (direct_result_only and not final_images.generated and not final_images.image_generation_failed
+            and not final_images.paths() and not last.get("file_ids") and not last.get("sediment_ids")
+            and not final_hint and not last.get("blocked")):
+        # 只有代码/思考信号而没有图片产物，不进入终态落库补查。
+        raise no_image_error()
     if conversation_id and (final_images.postprocessing or final_hint) and needs_snapshot and not resume_conversation_id:
         try:
-            document = backend._get_conversation(conversation_id)
+            if direct_result_only and not final_images.generated:
+                # 仅有文件导出提示时即时读一次，防止漏掉SSE省略的最终链接；无图不循环等落库。
+                document = backend._get_conversation(conversation_id, timeout_secs=3.0)
+            else:
+                document = _read_final_image_snapshot(
+                    backend, conversation_id, getattr(backend, '_image_submitted_message_id', ''),
+                    final_images, observed_tool_calls,
+                )
             delivery_document = document
             messages = document.get("messages")
             if not isinstance(messages, list):
@@ -974,6 +1371,10 @@ def stream_image_outputs(
         final_paths = final_images.paths()
     except ValueError as exc:
         raise final_error("最终修正版图片路径无效，未返回中间图片。") from exc
+    if (direct_result_only and not final_images.generated and not final_paths
+            and not final_images.image_generation_failed and not last.get("file_ids")
+            and not last.get("sediment_ids") and not last.get("blocked")):
+        raise no_image_error()
     result_source = "sandbox"
     download_message_id = final_images.final.get("id", "")
     if (allow_terminal_recovery and terminal_observation_safe and not final_paths and delivery_document is not None and request.image_transport == "conversation"
@@ -987,11 +1388,11 @@ def stream_image_outputs(
             required_tool_message_ids=observed_tool_ids,
             required_tool_calls=observed_tool_calls,
         )
-        if terminal is not None and terminal.kind == "python_output":
+        if terminal is not None and terminal.kind in {"python_output", "container_output"}:
             # 仅取最后成功执行明确输出的文件，不从代码或历史文件列表猜测路径。
             final_paths = [terminal.path]
             download_message_id = terminal.message_id
-            result_source = "python_terminal"
+            result_source = "container_terminal" if terminal.kind == "container_output" else "python_terminal"
         elif terminal is not None and terminal.kind == "native_image" and not (has_reference and config.image_require_reference_postprocess):
             try:
                 file_ids, sediment_ids = [], []
@@ -1032,6 +1433,14 @@ def stream_image_outputs(
             and final_images.is_complete() and final_images.code_tool_after_image):
         final_paths = [final_images.expected_final_path]
         result_source = "sandbox_contract"
+    if (final_images.image_generation_failed and final_images.is_complete() and not final_paths
+            and final_images.final.get("id") == final_images.current.get("id")):
+        # 明确的失败已结束本轮；继续取图只会占用执行名额，且不能回退旧图或重新生成。
+        raise ImageGenerationError(
+            "上游图片生成发生技术错误，本轮未交付最终图片。",
+            code="image_generation_failed", conversation_id=conversation_id,
+            image_execution=[final_images.execution_summary("unavailable")],
+        )
     if final_paths or final_images.postprocessing or final_hint:
         if not final_paths or not final_images.is_complete():
             raise final_error("图片后处理尚未完整交付最终图片，未返回中间图片。")
@@ -1072,6 +1481,16 @@ def stream_image_outputs(
     })
     if request.progress_callback:
         request.progress_callback("image_stream_resolve_start")
+    if direct_result_only and not file_ids and not sediment_ids:
+        if last.get("blocked"):
+            # 已有明确策略拒绝证据，无需额外tasks查询来重复确认。
+            raise ImageGenerationError(
+                "生图失败：上游内容策略拒绝了本次图片请求。",
+                status_code=400, error_type="invalid_request_error", code="content_policy_violation",
+                conversation_id=conversation_id,
+                image_execution=[final_images.execution_summary("unavailable")],
+            )
+        raise no_image_error()
     if message and not file_ids and not sediment_ids and last.get("blocked"):
         # 尝试从 /backend-api/tasks/ 获取详细错误信息
         detailed_error = _get_detailed_error_from_tasks(backend, conversation_id)
@@ -1086,7 +1505,7 @@ def stream_image_outputs(
     # 检测模型是否返回了文本描述（含 referenced_image_ids）而非实际生成图片
     # 这说明模型已发起图片生成工具调用，但 SSE 在工具完成前断开，
     # 图片可能正在异步生成中。需要使用更积极的轮询策略来获取结果。
-    is_text_reply = bool(message and is_model_text_reply_instead_of_image(message))
+    is_text_reply = not direct_result_only and bool(message and is_model_text_reply_instead_of_image(message))
     if is_text_reply:
         logger.info({
             "event": "image_detected_text_reply_with_ids",
@@ -1147,9 +1566,17 @@ def stream_image_outputs(
     poll_timeout = poll_timeout_secs if poll_timeout_secs is not None else config.image_poll_timeout_secs
 
     try:
-        image_urls = _resume_image_urls if _resume_image_urls is not None else backend.resolve_conversation_image_urls(
-            conversation_id, file_ids, sediment_ids, poll_timeout_secs=poll_timeout,
-        )
+        if _resume_image_urls is not None:
+            image_urls = _resume_image_urls
+        elif direct_result_only:
+            # 生成流已给出图片引用，直接取这些产物，不再进行10秒初始等待/120秒补查。
+            image_urls = backend.resolve_conversation_image_urls(
+                conversation_id, file_ids, sediment_ids, poll=False,
+            )
+        else:
+            image_urls = backend.resolve_conversation_image_urls(
+                conversation_id, file_ids, sediment_ids, poll_timeout_secs=poll_timeout,
+            )
     except (ImageContentPolicyError, ImagePollTimeoutError) as exc:
         # 当检测到文本回复时，task error 不应直接判定为内容策略违规，
         # 因为图片可能仍在后台异步生成中
@@ -1214,6 +1641,10 @@ def stream_image_outputs(
                                   execution=final_images.execution_summary(
                                       "image_tool", "unverified_reference" if has_reference else "valid_image"))
         return
+
+    if direct_result_only:
+        # 有引用但下载地址解析失败也不能落入旧的文本/查最近会话/重领预算分支。
+        raise final_error("生图失败：生成图片的下载地址不可用，未重新提交生成。")
 
     if resume_conversation_id:
         raise ImagePollTimeoutError("原会话图片仍未完成，可稍后继续等待。")
@@ -1526,14 +1957,17 @@ def _generate_single_image_impl(
     text_reply_retry_count = 0
     account_email = ""
 
+    pre_submit_attempts = 0
     while True:
+        generation_id = uuid.uuid4().hex
+        not_consumed = False
         try:
             if request.progress_callback:
                 request.progress_callback("getting_account")
             plan_type, _ = split_image_model(request.model)
             codex_model = is_codex_image_model(request.model)
             token = account_service.get_available_access_token(
-                plan_type=plan_type,
+                plan_type=plan_type, generation_id=generation_id,
                 source_type="codex" if codex_model else None,
                 plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
             )
@@ -1547,7 +1981,6 @@ def _generate_single_image_impl(
         account_email = str(account.get("email") or "").strip()
         logger.debug({
             "event": "image_account_lookup",
-            "token_prefix": token[:12] + "..." if len(token) > 12 else token,
             "account_email": account_email,
             "account_found": bool(account),
             "index": index,
@@ -1558,6 +1991,10 @@ def _generate_single_image_impl(
 
         def attach_context(exc):
             exc.account_email = account_email
+            if backend is not None and isinstance(getattr(backend, "_image_recovery_task_id", None), str):
+                exc.recovery_task_id = backend._image_recovery_task_id
+            if backend is not None and request.image_transport == "conversation":
+                exc.delivery_context = delivery_context(backend, request)
             voice = getattr(backend, "_voice_image_session", None)
             snapshot = voice.diagnostic_snapshot() if voice is not None else None
             if isinstance(snapshot, dict):
@@ -1574,11 +2011,26 @@ def _generate_single_image_impl(
                 exc.conversation_id = conversation_id
                 if not codex_model:
                     exc.resume_account_ref = account_service.image_account_ref(token)
+            if (backend is not None and getattr(backend, "_image_recovery_started", False) is True
+                    and getattr(backend, "_image_recovery_finished", False) is not True):
+                # 配额/程序异常同样收尾已登记的恢复任务，避免永久RUNNING挡住续查。
+                saved = getattr(backend, "_image_checkpoint_context", None)
+                if isinstance(saved, dict) and conversation_id:
+                    try:
+                        _delivery_checkpoint(backend, request, saved, conversation_id, index, total,
+                            phase="error", reason=getattr(exc, "code", None) or "recovery_interrupted")
+                    except Exception as checkpoint_error:
+                        logger.error({"event": "image_recovery_checkpoint_failed",
+                                      "error_type": type(checkpoint_error).__name__})
             return exc
 
         try:
             backend = OpenAIBackendAPI(access_token=token)
+            backend._image_generation_id = generation_id
+            backend._image_submission_guard = lambda: account_service.assert_image_submission_allowed(token, generation_id)
             backend.image_transport = request.image_transport
+            if callable(request.delivery_checkpoint_callback):
+                backend._image_resume_account_ref = account_service.image_account_ref(token)
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
@@ -1615,6 +2067,11 @@ def _generate_single_image_impl(
             succeeded = True
             return outputs
         except ImageQuotaExceeded as exc:
+            # 读取被限流不能证明原生成没有消耗额度；保留待结算租约供原会话续查。
+            not_consumed = exc.record.get("source") != "upstream_http_conversation_throttle"
+            if getattr(exc, "before_generation_submit", False) is True and pre_submit_attempts < 2:
+                pre_submit_attempts += 1
+                continue
             raise attach_context(image_quota_error(exc)) from exc
         except ImagePollTimeoutError as exc:
             attach_context(exc)
@@ -1622,7 +2079,6 @@ def _generate_single_image_impl(
         except ImageGenerationTimeoutError as exc:
             logger.warning({
                 "event": "image_generation_timeout",
-                "request_token": token,
                 "account_email": account_email,
                 "error": str(exc),
                 "index": index,
@@ -1637,7 +2093,6 @@ def _generate_single_image_impl(
         except ImageContentPolicyError as exc:
             logger.warning({
                 "event": "image_stream_content_policy_error",
-                "request_token": token,
                 "account_email": account_email,
                 "error": str(exc),
                 "index": index,
@@ -1658,13 +2113,13 @@ def _generate_single_image_impl(
             # 如果是模型返回文本而非图片，尝试换账号重试
             if (is_model_text_reply_instead_of_image(error_text) and not emitted_for_token
                     and not getattr(getattr(backend, "_voice_image_session", None), "sent", False)
-                    and not getattr(backend, "_webimage_generation_sent", False)):
+                    and not getattr(backend, "_webimage_generation_sent", False)
+                    and getattr(backend, "_image_generation_committed", False) is not True):
                 text_reply_retry_count += 1
                 if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES:
                     logger.warning({
                         "event": "image_model_text_reply_retry",
-                        "request_token": token,
-                        "account_email": account_email,
+                                "account_email": account_email,
                         "retry_count": text_reply_retry_count,
                         "index": index,
                         "error": error_text[:200],
@@ -1672,8 +2127,7 @@ def _generate_single_image_impl(
                     continue
                 logger.warning({
                     "event": "image_model_text_reply_exhausted_retries",
-                    "request_token": token,
-                    "account_email": account_email,
+                        "account_email": account_email,
                     "retry_count": text_reply_retry_count,
                     "index": index,
                 })
@@ -1688,24 +2142,34 @@ def _generate_single_image_impl(
                 )) from exc
             logger.warning({
                 "event": "image_stream_generation_error",
-                "request_token": token,
                 "account_email": account_email,
                 "error": error_text,
                 "index": index,
             })
             raise
         except Exception as exc:
+            if getattr(exc, "before_generation_submit", False) is True and pre_submit_attempts < 2:
+                pre_submit_attempts += 1
+                continue
+            evidence = image_quota_evidence_from_http(exc) or image_throttle_evidence_from_http(exc)
+            if evidence is not None:
+                record = account_service.mark_image_quota_limit(token, evidence)
+                not_consumed = True
+                if getattr(backend, "_image_generation_committed", False) is not True and pre_submit_attempts < 2:
+                    pre_submit_attempts += 1
+                    continue
+                raise attach_context(image_quota_error(ImageQuotaExceeded(record))) from exc
             last_error = str(exc)
             logger.warning({
                 "event": "image_stream_fail",
-                "request_token": token,
                 "account_email": account_email,
                 "error": last_error,
                 "index": index,
             })
             if (not emitted_for_token and is_token_invalid_error(last_error)
                     and not getattr(getattr(backend, "_voice_image_session", None), "sent", False)
-                    and not getattr(backend, "_webimage_generation_sent", False)):
+                    and not getattr(backend, "_webimage_generation_sent", False)
+                    and getattr(backend, "_image_generation_committed", False) is not True):
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
                 if refreshed_token and refreshed_token != token:
                     token = refreshed_token
@@ -1723,7 +2187,25 @@ def _generate_single_image_impl(
                     backend.close()
             finally:
                 # 语音会话关闭后再一次性结算并释放槽，避免同账号新任务与旧连接重叠。
-                account_service.mark_image_result(token, succeeded)
+                try:
+                    cid = getattr(backend, "image_conversation_id", "") if backend is not None else ""
+                    if not isinstance(cid, str) or not cid:
+                        cid = next((item.conversation_id for item in reversed(outputs) if item.conversation_id), "")
+                    if isinstance(cid, str) and cid:
+                        account_service.bind_image_generation(generation_id, cid)
+                    account_service.mark_image_result(token, succeeded, generation_id=generation_id, not_consumed=not_consumed)
+                finally:
+                    if backend is not None and getattr(backend, "_image_recovery_started", False) is True:
+                        saved = getattr(backend, "_image_checkpoint_context", None)
+                        cid = getattr(backend, "image_conversation_id", "") or next(
+                            (item.conversation_id for item in reversed(outputs) if item.conversation_id), "")
+                        if isinstance(saved, dict):
+                            cid = cid or saved.get("observed_evidence", {}).get("conversation_id", "")
+                        if cid and isinstance(saved, dict):
+                            try:
+                                _delivery_checkpoint(backend, request, saved, cid, index, total, phase="released")
+                            except Exception as checkpoint_error:
+                                logger.error({"event": "image_recovery_release_failed", "error_type": type(checkpoint_error).__name__})
 
 
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:

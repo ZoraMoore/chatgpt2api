@@ -1,6 +1,5 @@
 {
   "prepare": {
-    "client_prepare_state": "sent",
     "action": "next",
     "is_do_not_remember": false,
     "model": "gpt-6-thinking",
@@ -8,10 +7,21 @@
     "thinking_effort": "extended",
     "timezone": "Asia/Shanghai",
     "timezone_offset_min": -480,
+    "client_contextual_info": {
+      "app_name": "chatgpt.com",
+      "app_surface": "codex_browser",
+      "has_web_push_capabilities": true,
+      "web_push_notification_permission": "default"
+    },
     "local_function_names": [
       "local.continue_in_work"
     ],
+    "supported_encodings": [
+      "v1"
+    ],
+    "client_prepare_state": "sent",
     "partial_query": {
+      "id": "fixture-prepare-id",
       "author": {
         "role": "user"
       },
@@ -20,8 +30,10 @@
         "parts": [
           "测试小猫"
         ]
-      },
-      "id": "fixture-prepare-id"
+      }
+    },
+    "browser_context": {
+      "instance_id": "fixture-browser-id"
     },
     "client_prepare_dispatch": "debounced",
     "client_prepare_source": "context_change"

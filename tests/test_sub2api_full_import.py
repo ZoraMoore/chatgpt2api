@@ -27,6 +27,34 @@ def make_service(rows=()):
 
 
 class FullSub2APIImportTests(unittest.TestCase):
+    def test_sub2api_import_keeps_source_account_name_separate_from_email(self):
+        source = self.exported()
+        source["name"] = "原站账号-教育组-07"
+        source["credentials"]["email"] = "new-profile@example.test"
+        source["credentials"]["name"] = "上游资料昵称"
+        payload = AccountService._prepare_account_payload(source)
+        self.assertEqual("原站账号-教育组-07", payload.get("name"))
+        self.assertEqual("new-profile@example.test", payload["email"])
+
+    def test_existing_sub2api_names_are_restored_and_survive_remote_refresh(self):
+        now = int(time.time())
+        access_token = token(now, now + 3600)
+        service, _ = make_service([{
+            "access_token": access_token, "quota": 10,
+            "name": "被资料覆盖的名字", "email": "old-profile@example.test",
+            "sub2api": {"id": 7, "name": "原站自定义账号名"},
+        }])
+        self.assertEqual("原站自定义账号名", service.get_account(access_token).get("name"))
+        updated = service.update_account(access_token, {
+            "name": "ChatGPT 昵称", "email": "new-profile@example.test",
+        }, quiet=True, remote=True)
+        self.assertEqual("原站自定义账号名", updated["name"])
+        self.assertEqual("new-profile@example.test", updated["email"])
+        rotated = service._apply_refreshed_tokens(access_token, {
+            "access_token": token(now + 1, now + 7200),
+        }, "fixture-token-refresh")
+        self.assertEqual("原站自定义账号名", service.get_account(rotated)["name"])
+
     def exported(self):
         now = int(time.time())
         return {"id": 7, "name": "fixture@example.test", "platform": "openai", "type": "oauth",
@@ -35,12 +63,15 @@ class FullSub2APIImportTests(unittest.TestCase):
                     "id_token": "fixture-id", "expires_at": str(now + 3600), "client_id": "fixture-client",
                     "plan_type": "plus", "account_id": "account-id", "custom_credential": "retained"}}
 
-    def test_nested_export_preserves_credentials_and_metadata(self):
+    def test_nested_export_keeps_access_token_and_metadata_without_refresh_credentials(self):
         source = self.exported()
         payload = AccountService._prepare_account_payload(source)
         self.assertIsNotNone(payload)
         for key, value in source["credentials"].items():
-            self.assertEqual(value, payload[key])
+            if key in {"refresh_token", "id_token"}:
+                self.assertNotIn(key, payload)
+            else:
+                self.assertEqual(value, payload[key])
         self.assertEqual(source["extra"], payload["sub2api"]["extra"])
         self.assertNotIn("credentials", payload["sub2api"])
         self.assertEqual("codex", payload["source_type"])
@@ -71,7 +102,8 @@ class FullSub2APIImportTests(unittest.TestCase):
         with patch.object(sub.sub2api_session_manager, "export_accounts", return_value={"accounts": [source]}):
             accounts, errors = sub._fetch_accounts_for_import({"id": "test"}, ["7"])
         self.assertEqual([], errors)
-        self.assertEqual("fixture-refresh", accounts[0]["refresh_token"])
+        self.assertNotIn("refresh_token", accounts[0])
+        self.assertEqual("sub2api", accounts[0]["refresh_owner"])
         store = Mock()
         store.get_import_job.return_value = {"total": 1, "errors": []}
         with patch.object(sub, "account_service") as service:
@@ -96,7 +128,7 @@ class FullSub2APIImportTests(unittest.TestCase):
         self.assertFalse(item["auto_refresh_token"])
         self.assertEqual("http://proxy.test:80", item["proxy"])
         self.assertEqual(5, item["success"])
-        self.assertEqual("new-refresh", item["refresh_token"])
+        self.assertNotIn("refresh_token", item)
 
     def test_older_export_does_not_replace_newer_credentials(self):
         now = int(time.time());old = token(now-100,now+10);new = token(now,now+3600)

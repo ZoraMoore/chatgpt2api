@@ -14,7 +14,10 @@ from api.support import resolve_web_asset, start_limited_account_watcher
 from services.backup_service import backup_service
 from services.config import config
 from services.image_service import start_image_cleanup_scheduler
+from services.image_delivery_trace import ImageDeliveryTraceMiddleware
+from services.image_task_service import image_task_service
 from services.image_space_service import start_image_space_scheduler
+from services.sub2api_service import start_sub2api_sync_scheduler
 
 
 def create_app() -> FastAPI:
@@ -26,15 +29,19 @@ def create_app() -> FastAPI:
         thread = start_limited_account_watcher(stop_event)
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
         space_thread = start_image_space_scheduler(stop_event)
+        source_sync_thread = start_sub2api_sync_scheduler(stop_event)
         backup_service.start()
         config.cleanup_old_images()
+        image_task_service.start_auto_recovery()
         try:
             yield
         finally:
             stop_event.set()
+            image_task_service.stop_auto_recovery()
             thread.join(timeout=1)
             cleanup_thread.join(timeout=1)
             space_thread.join(timeout=1)
+            source_sync_thread.join(timeout=1)
             backup_service.stop()
 
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
@@ -46,6 +53,7 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(ImageDeliveryTraceMiddleware)
     app.include_router(ai.create_router())
     app.include_router(accounts.create_router())
     app.include_router(account_operations.create_router())
@@ -60,6 +68,9 @@ def create_app() -> FastAPI:
 
     @app.api_route("/{full_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
     async def serve_web(full_path: str):
+        # API 拼写错误或失效路由必须返回 JSON，不能把 SPA 首页当作成功响应。
+        if full_path.strip("/") == "api" or full_path.strip("/").startswith("api/"):
+            raise HTTPException(status_code=404, detail={"error": "API 接口不存在，请刷新页面后重试"})
         asset = resolve_web_asset(full_path)
         if asset is not None:
             if asset.suffix == ".html":
@@ -78,6 +89,6 @@ def create_app() -> FastAPI:
 def extended_page(asset):
     """统一加载独立页面扩展，使 Next 客户端跳转到号池时也能显示入口。"""
     html = asset.read_text(encoding="utf-8")
-    html = html.replace("</body>", '<script src="/account-image-space.js?v=e1c0b3b7529f" defer></script>'
+    html = html.replace("</body>", '<script src="/account-image-space.js?v=bcb446921221" defer></script>'
                         '<script src="/image-transport-settings.js?v=132d5ab480fa" defer></script></body>')
     return HTMLResponse(html, headers={"Cache-Control": "no-cache"})

@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from html.parser import HTMLParser
 
-from services.protocol.final_image import validated_sandbox_image_path
+from services.protocol.final_image import SANDBOX_IMAGE_RE, validated_sandbox_image_path
+from services.protocol.conversation_document import allows_image_terminal_check
 
 
 _MAX_MESSAGES = 4096
@@ -15,6 +17,17 @@ _OUTPUT = re.compile(
     r"\s*(?:<<ImageDisplayed>>\s*)?(/mnt/data/[^\s<>\"'()?#]{1,2048})"
     r"(?:\s+\([1-9][0-9]{0,5},\s*[1-9][0-9]{0,5}\))?\s*(?:<<ImageDisplayed>>\s*)?\Z"
 )
+# 实际观察到的ImageMagick输出：只允许这条弃用提示和一条完整PNG记录。
+_IDENTIFY_WARNING = ('WARNING: The convert command is deprecated in IMv7, use "magick" '
+                     'instead of "convert" or "magick convert"')
+_PNG_IDENTIFY = re.compile(
+    r"(/mnt/data/[^\s<>\"'()?#]{1,2048}\.png) PNG "
+    r"([1-9][0-9]{0,5})x([1-9][0-9]{0,5}) \2x\3\+0\+0 "
+    r"(?:8|16)-bit sRGB [0-9]{1,12}(?:\.[0-9]{1,8})?(?:B|KiB|MiB|GiB) "
+    r"[0-9]{1,8}(?:\.[0-9]{1,8})?u [0-9]{1,6}:[0-9]{2}\.[0-9]{1,6}\Z"
+)
+
+
 _FAILURE_STATES = {"error", "failed", "failure", "interrupted", "cancelled", "canceled", "timeout", "timed_out",
                    "content_filter", "refusal"}
 
@@ -95,6 +108,7 @@ def _branch(document: dict) -> list[dict] | None:
         author, content, metadata = item.get("author"), item.get("content"), item.get("metadata", {})
         if (not isinstance(author, dict) or not isinstance(content, dict) or not isinstance(metadata, dict)
                 or len(content) > 128 or len(metadata) > 128
+                or not isinstance(content.get("content_type"), str)
                 or author.get("role") not in ("user", "assistant", "tool", "system", "developer")):
             return None
         parts = content.get("parts", [])
@@ -226,82 +240,416 @@ def _python_path(call: dict, result: dict) -> str | None:
     return path
 
 
+def _container_path(call: dict, result: dict) -> str | None:
+    """只接受已观测到的容器输出契约，不从shell代码提取文件名。"""
+    content, metadata = result['content'], result['metadata']
+    call_meta = call['metadata']
+    aggregate = metadata.get('aggregate_result')
+    code = call['content'].get('text')
+    if (result['author'].get('name') != 'container.exec'
+            or content.get('content_type') != 'execution_output' or not _successful(result)
+            or content.get('parts', []) != []
+            or call['author'].get('role') != 'assistant' or call.get('recipient') != 'container.exec'
+            or call['content'].get('content_type') != 'code' or not _successful(call)
+            or not isinstance(code, str) or not 0 < len(code) <= 262144
+            or not isinstance(aggregate, dict)
+            or set(aggregate) != {'status', 'messages', 'final_expression_output'}
+            or aggregate.get('status') != 'success' or aggregate.get('messages') != []
+            or _failed(aggregate)):
+        return None
+    # 上游container消息的parent_id不指向相邻调用，用三种轮次标识联合绑定执行结果。
+    for key in ('request_id', 'turn_exchange_id', 'working_turn_id'):
+        if not _valid_id(call_meta.get(key)) or call_meta[key] != metadata.get(key):
+            return None
+    output = content.get('text')
+    if not isinstance(output, str) or aggregate.get('final_expression_output') != output:
+        return None
+    path = _output_path(output)
+    if path:
+        return path
+    if len(output) > _MAX_OUTPUT:
+        return None
+    lines = [line for line in output.strip().splitlines() if line.strip()]
+    if lines and lines[0] == _IDENTIFY_WARNING:
+        lines = lines[1:]
+    if len(lines) != 1:
+        return None
+    match = _PNG_IDENTIFY.fullmatch(lines[0])
+    if not match:
+        return None
+    try:
+        return validated_sandbox_image_path(match[1])
+    except ValueError:
+        return None
+
+
+class _CompletionTextParser(HTMLParser):
+    """仅提取否定判定所需文本；未知展示组件也不应遮住否定词。"""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.quote_depth = 0
+
+    def handle_data(self, data):
+        if not self.quote_depth:
+            self.parts.append(data)
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"blockquote", "q", "pre", "code"}:
+            self.quote_depth += 1
+            self.parts.append("\n")
+        elif tag == "br" and not self.quote_depth:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in {"blockquote", "q", "pre", "code"} and self.quote_depth:
+            self.quote_depth -= 1
+            self.parts.append("\n")
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+
+
+def _display_text(value: str) -> str | None:
+    if not isinstance(value, str) or len(value) > 262144:
+        return None
+    parser = _CompletionTextParser()
+    try:
+        parser.feed(value)
+        parser.close()
+    except (ValueError, TypeError):
+        return None
+    return "".join(parser.parts)
+
+
+def _direct_completion_text(text: str) -> str:
+    """历史拒绝的引用和代码示例不能取代本次交付结论。"""
+    text = re.sub(r"(?ms)^[ \t]*(`{3,}|~{3,})[^\n]*\n.*?^[ \t]*\1[^\n]*(?:\n|$)", "\n", text)
+    text = re.sub(r"(?m)^[ \t]*>[^\n]*(?:\n|$)", "\n", text)
+    text = re.sub(r"`[^`\n]*`", "\n", text)
+    visible = _display_text(text)
+    text = visible if visible is not None else text
+    return re.sub(r'''“[^“”]*”|「[^「」]*」|『[^『』]*』|‘[^‘’]*’|"[^"\n]*"|(?<!\w)'[^'\n]*'(?!\w)''', "\n", text)
+
+
+def _direct_refusal_match(pattern: str, text: str, *, current_context: bool = False) -> bool:
+    for match in re.finditer(pattern, text, re.I):
+        leading = text[max(0, match.start() - 160):match.start()]
+        prefix = re.split(r"[\n。！？；;，,]", leading)[-1][-80:]
+        # “不是无法完成”是在否定拒绝；用户要求和历史转述也不是本次拒绝。
+        if re.search(r"(?:并非|并不是|不是|并不(?:是|会)?|没有说|未曾说|用户(?:说|要求|提示)|原话|引用|示例|例如|比如|此前|之前|曾经|上次|如果|假如|假设|若)[^\n。！？；;，,]{0,80}$", prefix):
+            continue
+        if current_context and not re.search(r"(?:目前|当前|本次|这次|此次|由于)[^\n。！？；;]{0,120}$", leading):
+            continue
+        if re.search(r"(?:没有|并未|不会|不曾|未曾)违反", match.group()):
+            continue
+        return True
+    return False
+
+
+def _final_delivery_rejection_reason(message: dict, *, completed: bool = False) -> str | None:
+    """返回对外终态拒绝原因；completed 仅兼容本轮已确认完成的 final。"""
+    if (not isinstance(message, dict) or not isinstance(message.get("author"), dict)
+            or message["author"].get("role") != "assistant"
+            or message.get("recipient", "all") != "all"
+            or message.get("status") != "finished_successfully"
+            or message.get("channel") not in (None, "final", "commentary")
+            or (message.get("end_turn") is not True
+                and (not completed or message.get("channel") == "commentary"))):
+        return None
+    content = message.get("content")
+    if not isinstance(content, dict) or content.get("content_type") not in ("text", "multimodal_text"):
+        return None
+    parts = content.get("parts", [])
+    if not isinstance(parts, list) or any(not isinstance(p, (str, dict)) for p in parts):
+        return None
+    text = "\n".join(p for p in parts if isinstance(p, str))
+    if not isinstance(content.get("text", ""), str) or len(text) + len(content.get("text", "")) > 262144:
+        return "quality_rejected"
+    text += "\n" + content.get("text", "")
+    metadata = message.get("metadata") or {}
+    dil = metadata.get("model_dil_v2") if isinstance(metadata, dict) else None
+    fallback = dil.get("fallbackMarkdown") if isinstance(dil, dict) else None
+    if fallback is not None:
+        if not isinstance(fallback, str) or len(text) + len(fallback) > 262144:
+            return "quality_rejected"
+        text += "\n" + fallback
+    text = _direct_completion_text(text)
+    # 策略拒绝可能以已结束的 commentary 返回，且不会补齐此前的工具返回。
+    policy_pattern = r"(?:生成的)?(?:图片|图像)[^\n。]{0,100}违反(?:了)?[^\n。]{0,160}(?:防护限制|内容政策|安全政策)"
+    if _direct_refusal_match(policy_pattern, text):
+        return "content_policy_rejected"
+    if isinstance(metadata, dict) and (metadata.get("refusal") or metadata.get("is_refusal") is True):
+        return "quality_rejected"
+    # “不输出不合格成品”也可能只是质量承诺，必须有本轮实际失败上下文。
+    withholding_patterns = (
+        r"不将[^\n。]{0,100}(?:未达标|不合格|修复痕迹|被重绘)[^\n。]{0,100}作为[^\n。]{0,40}(?:成品|终稿)[^\n。]{0,40}(?:交付|输出)",
+        r"(?:不能|无法|不可)[^\n。]{0,120}作为(?:合格|最终)?(?:成品|图片|图像|终稿)[^\n。]{0,40}(?:输出|交付)",
+        r"不(?:输出|交付)[^\n。]{0,140}(?:不合格|未达标|修复痕迹|被重绘)[^\n。]{0,80}(?:成品|图片|图像|终稿)",
+    )
+    current_failure_pattern = (
+        r"(?:无法|未能|不能)[^\n。]{0,240}(?:完成|确认|修复|清除|保护|保证)"
+        r"|(?:图片|图像|结果|成品)(?:确实|仍然|依然|还是)?(?:未达标|不合格)"
+    )
+    if (_direct_refusal_match(current_failure_pattern, text, current_context=True)
+            and any(_direct_refusal_match(pattern, text) for pattern in withholding_patterns)):
+        return "quality_rejected"
+    # 上游成功结束的是消息，仍可能明确告知图片不合格；不能据状态码交付草稿。
+    patterns = (
+        r"(?:本次|这次|此次)?生成未能满足[^\n。]{0,300}(?:要求|交付)",
+        r"(?:不能|无法|不应|不可)作为[^\n。]{0,100}(?:合格|最终)[^\n。]{0,100}交付",
+        r"(?:未能|无法)(?:完成|生成|提供|交付)[^\n。]{0,120}(?:图片|图像|修改|编辑|终稿)",
+        r"(?:图片|图像|本次生成)(?:生成|处理|修改|编辑)?失败",
+        r"(?:图片|图像)(?:尚未|还未|没有)(?:生成|完成)",
+        r"(?:仍在|还在|正在)(?:处理|修改|生成|编辑)",
+        r"(?:画像|イメージ)[^\n。]{0,120}(?:生成|作成|編集|処理)[^\n。]{0,40}(?:できません|できなかった|失敗)",
+        r"\b(?:cannot|can't|unable to|failed to)\s+(?:generate|create|edit|deliver|provide)\b",
+        r"\b(?:does not|doesn't|did not|didn't|fails? to)\s+meet\s+(?:the|your)\s+requirements?\b",
+    )
+    return "quality_rejected" if any(_direct_refusal_match(pattern, text) for pattern in patterns) else None
+
+
+def final_delivery_rejected(message: dict, *, completed: bool = False) -> bool:
+    """兼容布尔判定接口，终态选择器另外保留策略与质量拒绝的具体原因。"""
+    return _final_delivery_rejection_reason(message, completed=completed) is not None
+
+
+def _final_assets(final: dict) -> tuple[list[tuple[str, str]], bool]:
+    """正文交付优先；仅兼容声明式fallback，普通引用索引不能扩充交付列表。"""
+    content = final["content"]
+    parts = content.get("parts", [])
+    text = "\n".join(part for part in parts if isinstance(part, str))
+
+    def parse(value):
+        assets = []
+        for match in SANDBOX_IMAGE_RE.finditer(value):
+            assets.append(("sandbox", validated_sandbox_image_path(match[1])))
+        for match in re.finditer(r"(?:file-service|sediment)://([A-Za-z0-9_-]{1,128})(?=[\s)\]\"<>]|$)", value):
+            assets.append(("native", match[1]))
+        return list(dict.fromkeys(assets))
+
+    assets = parse(text)
+    for part in parts:
+        if isinstance(part, dict) and part.get("content_type") == "image_asset_pointer":
+            pointer = part.get("asset_pointer")
+            match = _POINTER.fullmatch(pointer) if isinstance(pointer, str) else None
+            if not match:
+                raise ValueError("invalid final pointer")
+            assets.append(("native", match[1]))
+    assets = list(dict.fromkeys(assets))
+    if not assets:
+        dil = final["metadata"].get("model_dil_v2")
+        fallback = dil.get("fallbackMarkdown") if isinstance(dil, dict) else None
+        if isinstance(fallback, str) and len(fallback) <= 262144:
+            assets = parse(fallback)
+    return assets, bool(text.strip())
+
+
+def _inspection(message: dict) -> bool:
+    name = message["author"].get("name")
+    return isinstance(name, str) and (name in {"open_image", "container.open_image"} or name.endswith(".open_image"))
+
+
+def _pending_calls(turn: list[dict]) -> bool:
+    pending = []
+    for item in turn:
+        role = item["author"]["role"]
+        recipient = item.get("recipient", "all")
+        if role == "assistant" and recipient != "all":
+            pending.append(recipient)
+        elif role == "tool":
+            name = item["author"].get("name")
+            if name in pending and (item.get("status") == "finished_successfully" or _failed(item)):
+                pending.remove(name)
+    return bool(pending)
+
+
 def select_terminal_image_delivery(
     document, *, conversation_id: str, submitted_message_id: str = "",
     expected_final_message_id: str = "", expected_image_message_id: str = "",
     required_tool_message_ids=(), required_tool_calls: dict[str, str] | None = None,
+    completed_final_message_id: str = "", completion_receipt: dict | None = None,
+    diagnostic: dict | None = None,
 ) -> TerminalImageDelivery | None:
-    """只接受本轮空 final 之后已确定的最后工具产物；无法证明时返回 None。"""
-    if (not isinstance(document, dict) or not _valid_id(conversation_id)
-            or document.get("async_status") is not None):
+    """以本轮完成证据和产物来源选图；完成说明的语言和长度不决定成功。"""
+    info = diagnostic if diagnostic is not None else {}
+    info.clear()
+
+    def reject(reason):
+        info["reason"] = reason
         return None
+
+    def accept(result, source):
+        info.update(reason="ready", completion_source=source, result_source=result.kind)
+        return result
+
+    if not isinstance(document, dict) or not _valid_id(conversation_id):
+        return reject("invalid_document")
     ids = [document[key] for key in ("conversation_id", "id") if key in document]
     if not ids or any(value != conversation_id for value in ids):
-        return None
+        return reject("conversation_mismatch")
+    if not allows_image_terminal_check(document):
+        return reject("document_in_progress" if document.get("async_status") == 3 else "unsupported_document_state")
     if any(not isinstance(value, str) or value and not _valid_id(value)
-           for value in (submitted_message_id, expected_final_message_id, expected_image_message_id)):
-        return None
+           for value in (submitted_message_id, expected_final_message_id, expected_image_message_id, completed_final_message_id)):
+        return reject("invalid_message_identity")
     if (not isinstance(required_tool_message_ids, (list, tuple, set, frozenset))
             or len(required_tool_message_ids) > _MAX_MESSAGES
             or any(not _valid_id(value) for value in required_tool_message_ids)):
-        return None
+        return reject("invalid_observed_tools")
     if required_tool_calls is not None and (
             not isinstance(required_tool_calls, dict) or len(required_tool_calls) > _MAX_MESSAGES
             or any(not _valid_id(key) or not _valid_id(value) or value == "all"
                    for key, value in required_tool_calls.items())):
-        return None
+        return reject("invalid_observed_calls")
     messages = _branch(document)
     if not messages:
-        return None
+        return reject("invalid_branch")
     users = [i for i, item in enumerate(messages) if item["author"].get("role") == "user"]
     if submitted_message_id:
         selected = [i for i in users if messages[i]["id"] == submitted_message_id]
         if len(selected) != 1 or selected[0] != users[-1]:
-            return None
+            return reject("submission_mismatch")
         start = selected[0]
     elif len(users) == 1:
         start = users[0]
     else:
-        return None
+        return reject("ambiguous_submission")
     turn = messages[start:]
     calls = {item["id"]: item.get("recipient") for item in turn
              if item["author"].get("role") == "assistant" and item.get("recipient", "all") != "all"}
     if any(calls.get(key) != value for key, value in (required_tool_calls or {}).items()):
-        return None
-    final = turn[-1]
-    if (final["author"].get("role") != "assistant" or final.get("channel") != "final"
-            or final.get("recipient", "all") != "all" or final.get("end_turn") is not True
-            or not _successful(final) or final["metadata"].get("bidi_voice_fem_message") is True
-            or final["content"].get("content_type") != "text"
-            or "parts" not in final["content"]
-            or any(not isinstance(part, str) or part.strip() for part in final["content"].get("parts", []))
-            or final["content"].get("text", "").strip()
-            or expected_final_message_id and final["id"] != expected_final_message_id):
-        return None
+        return reject("observed_calls_missing")
     tool_indexes = [i for i, item in enumerate(turn) if item["author"].get("role") == "tool"]
-    if not tool_indexes or not set(required_tool_message_ids).issubset({turn[i]["id"] for i in tool_indexes}):
-        return None
-    index = tool_indexes[-1]
-    # 终态前只允许已经完成的思考/摘要；任何新工具调用、正文或系统操作都使候选失效。
-    for item in turn[index + 1:-1]:
-        if (item["author"].get("role") != "assistant" or item.get("recipient", "all") != "all"
-                or item["content"].get("content_type") not in ("thoughts", "reasoning_recap")
-                or not _successful(item)):
-            return None
+    info["tool_count"] = len(tool_indexes)
+    if not set(required_tool_message_ids).issubset({turn[i]["id"] for i in tool_indexes}):
+        return reject("observed_tools_missing")
+    last = turn[-1]
+    formal_final = (last["author"].get("role") == "assistant" and last.get("recipient", "all") == "all"
+                    and last.get("channel") in ("final", None) and last.get("end_turn") is True
+                    and _successful(last) and last["content"].get("content_type") in ("text", "multimodal_text")
+                    and ("parts" in last["content"] or "text" in last["content"])
+                    and last["metadata"].get("bidi_voice_fem_message") is not True)
+    if expected_final_message_id and last["id"] != expected_final_message_id:
+        return reject("final_identity_mismatch")
+    refusal_reason = _final_delivery_rejection_reason(last, completed=formal_final)
+    if refusal_reason:
+        return reject(refusal_reason)
+    if _pending_calls(turn):
+        return reject("calls_pending")
+    production = [i for i in tool_indexes if not _inspection(turn[i])]
+    # 明确失败先于等待终态，避免失败的新工作被归为可重查的缺少完成信号。
+    from services.protocol.final_image import is_image_generation_failure
+    if production:
+        if any(_failed(turn[i]) or _failed(turn[i]["metadata"]) for i in tool_indexes if i >= production[-1]):
+            return reject("last_tool_failed")
+        if is_image_generation_failure(turn[production[-1]]):
+            return reject("generation_failed")
+    if any(turn[i].get("status") not in {"finished_successfully", "failed", "error", "cancelled", "canceled"}
+           for i in tool_indexes):
+        return reject("tool_incomplete")
+
+    completion_source = "final" if formal_final else ""
+    if not completion_source and completed_final_message_id:
+        indexes = [i for i, item in enumerate(turn) if item["id"] == completed_final_message_id]
+        if len(indexes) == 1:
+            tail = turn[indexes[0] + 1:]
+            harmless_tail = all(item["author"]["role"] == "assistant"
+                and item.get("recipient", "all") == "all" and _successful(item)
+                and item["content"].get("content_type") in {"thoughts", "reasoning_recap"} for item in tail)
+            if (harmless_tail and all(_successful(turn[i]) for i in tool_indexes)
+                    and not _failed(turn[indexes[0]]) and not _failed(turn[indexes[0]]["metadata"])):
+                completion_source = "stream_complete"
+    if not completion_source and completion_receipt:
+        from services.protocol.image_delivery import receipt_matches
+        if receipt_matches(completion_receipt, document, submitted_message_id or turn[0]["id"]):
+            completion_source = "stored_completion"
+    if not completion_source:
+        return reject("completion_missing" if tool_indexes else "generation_pending")
+    refusal_reason = _final_delivery_rejection_reason(last, completed=True)
+    if refusal_reason:
+        return reject(refusal_reason)
+    if not tool_indexes:
+        return reject("no_image_generated")
+    if not production:
+        return reject("no_image_generated")
+    index = production[-1]
+    if any(item["author"]["role"] == "assistant" and not _successful(item)
+           for item in turn[index + 1:-1]):
+        return reject("tool_incomplete")
+    # 查看图片不是新产物；但查看失败或未完成仍不能证明交付完成。
+    if any(not _successful(turn[i]) for i in tool_indexes if i >= index):
+        return reject("last_tool_failed")
+    if is_image_generation_failure(turn[index]):
+        return reject("generation_failed")
     inputs = _input_assets(turn[0])
     if inputs is None:
-        return None
-    images = [(i, pointer) for i in tool_indexes if (pointer := _image_pointer(turn[i], inputs)) is not None]
-    if not images or expected_image_message_id and turn[images[-1][0]]["id"] != expected_image_message_id:
-        return None
-    result = turn[index]
-    if images[-1][0] == index:
-        # 不返回原消息 metadata/正文，避免下载器把输入图或其他引用重新加入候选。
+        return reject("invalid_input_assets")
+    images = [(i, pointer) for i in production if (pointer := _image_pointer(turn[i], inputs)) is not None]
+    if expected_image_message_id and (not images or turn[images[-1][0]]["id"] != expected_image_message_id):
+        return reject("image_identity_mismatch")
+    info["candidate_count"] = len(images)
+    if completion_source == "stored_completion":
+        # 恢复确认的是既有交付决定，不能重新挑最新图片从而把已选的A换成B。
+        matches = [(i, pointer) for i, pointer in images
+                   if turn[i]["id"] == completion_receipt["message_id"]
+                   and pointer["asset_pointer"].split("://")[-1] == completion_receipt["asset_id"]]
+        if len(matches) != 1 or not images or images[-1][0] != index:
+            return reject("receipt_artifact_mismatch")
+        selected_index, pointer = matches[0]
+        item = turn[selected_index]
+        image = {"id": item["id"], "author": dict(item["author"]),
+                 "content": {"content_type": "multimodal_text", "parts": [pointer]}}
+        return accept(TerminalImageDelivery("native_image", item["id"], image_message=image), completion_source)
+    final = last if last["author"]["role"] == "assistant" and last["content"].get("content_type") in {"text", "multimodal_text"} else None
+    try:
+        assets, _ = _final_assets(final) if final else ([], False)
+    except (ValueError, TypeError):
+        return reject("invalid_final_reference")
+    if assets:
+        if len(assets) != 1:
+            return reject("ambiguous_final_assets")
+        kind, asset = assets[0]
+        if kind == "sandbox":
+            return accept(TerminalImageDelivery("sandbox_final", final["id"], path=asset), completion_source)
+        if asset in inputs:
+            return reject("input_asset_selected")
+        matches = [(i, pointer) for i, pointer in images if _POINTER.fullmatch(pointer["asset_pointer"])[1] == asset]
+        if len(matches) != 1 or not images or images[-1][0] != index:
+            return reject("unbound_final_asset")
+        selected_index, pointer = matches[0]
+        item = turn[selected_index]
+        image = {"id": item["id"], "author": dict(item["author"]),
+                 "content": {"content_type": "multimodal_text", "parts": [pointer]}}
+        return accept(TerminalImageDelivery("native_image", item["id"], image_message=image), completion_source)
+    # 文案、语言和展示组件只用于显示，下载仍只使用本轮工具的可信文件身份。
+    if final:
+        text = "".join(part for part in final["content"].get("parts", []) if isinstance(part, str))
+        if re.search(r"请选择.*(?:第一|第二|哪|其中)|choose (?:one|between)", text, re.I):
+            return reject("ambiguous_final_choice")
+    if images and images[-1][0] == index:
+        result = turn[index]
         image = {"id": result["id"], "author": dict(result["author"]),
                  "content": {"content_type": "multimodal_text", "parts": [images[-1][1]]}}
-        return TerminalImageDelivery("native_image", result["id"], image_message=image)
-    if index > 0 and images[-1][0] < index:
-        path = _python_path(turn[index - 1], result)
-        if path:
-            return TerminalImageDelivery("python_output", result["id"], path=path)
-    return None
+        return accept(TerminalImageDelivery("native_image", result["id"], image_message=image), completion_source)
+    result = turn[index]
+    if images and index > images[-1][0]:
+        name = result["author"].get("name")
+        call = next((item for item in reversed(turn[:index])
+                     if item["author"]["role"] == "assistant" and item.get("recipient") == name), None)
+        if call:
+            path = _python_path(call, result)
+            if path:
+                return accept(TerminalImageDelivery("python_output", result["id"], path=path), completion_source)
+            path = _container_path(call, result)
+            if path:
+                return accept(TerminalImageDelivery("container_output", result["id"], path=path), completion_source)
+        return reject("postprocess_artifact_unconfirmed")
+    pointers = [p for p in result["content"].get("parts", []) if isinstance(p, dict) and p.get("content_type") == "image_asset_pointer"]
+    if len(pointers) > 1:
+        return reject("ambiguous_tool_assets")
+    if pointers and any(isinstance(p.get("asset_pointer"), str) and p["asset_pointer"].split("://")[-1] in inputs for p in pointers):
+        return reject("input_asset_selected")
+    return reject("artifact_missing")

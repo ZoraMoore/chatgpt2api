@@ -2,8 +2,11 @@ name: chatgpt2api-image
 
 services:
   chatgpt2api-image:
-    # 同步主站已验证的运行镜像，保留本站独立配置和数据。
-    image: local/security/chatgpt2api-image:global-glass-20261023
+    # 从仓库源码构建应用，配置与持久化数据由部署者独立提供。
+    image: chatgpt2api-image:local
+    build:
+      context: .
+      target: application
     container_name: chatgpt2api-image
     restart: unless-stopped
     stop_grace_period: 120s
@@ -11,14 +14,14 @@ services:
       - "127.0.0.1:8089:80"
     # 限制二开实例资源，降低对同机客户服务的影响。
     cpus: 1.5
-    mem_limit: 1g
+    mem_limit: 2g
     pids_limit: 256
     environment:
       STORAGE_BACKEND: json
       CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:?请在 .env 中设置新站独立管理员密钥}
       CHATGPT2API_LOG_MAX_BYTES: ${CHATGPT2API_LOG_MAX_BYTES:-67108864}
       CHATGPT2API_LOG_BACKUP_COUNT: ${CHATGPT2API_LOG_BACKUP_COUNT:-2}
-      CHATGPT2API_IMAGE_WORKER_LIMIT: ${CHATGPT2API_IMAGE_WORKER_LIMIT:-4}
+      CHATGPT2API_IMAGE_WORKER_LIMIT: ${CHATGPT2API_IMAGE_WORKER_LIMIT:-100}
       # 后台尚未保存生图模式时默认使用语音模式。
       CHATGPT2API_IMAGE_TRANSPORT: voice
     volumes:
@@ -41,7 +44,9 @@ services:
   image-sentinel:
     # 仅供显式回退旧协议时使用；正式语音路径不启动浏览器服务。
     profiles: [legacy-sentinel]
-    image: local/chatgpt2api-image-sentinel:lfl9h1ji
+    build:
+      context: .
+      dockerfile: docker/sentinel/Dockerfile
     container_name: chatgpt2api-image-sentinel
     restart: unless-stopped
     # 网络隔离；通过私有 socket 加载预热页面并计算校验。

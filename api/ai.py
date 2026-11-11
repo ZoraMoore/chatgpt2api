@@ -11,6 +11,8 @@ from services.content_filter import check_request, request_shape, request_text
 from services.config import config
 from services.editable_file_task_service import editable_file_task_service
 from services.log_service import LoggedCall
+from services.image_task_service import image_task_service
+from utils.helper import resolve_image_transport, new_uuid
 from services.protocol import (
     anthropic_v1_messages,
     openai_v1_chat_complete,
@@ -97,10 +99,12 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
-        payload["_image_transport"] = config.image_transport
+        payload["_image_transport"] = resolve_image_transport(body.model, config.image_transport)
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
+        payload["_delivery_checkpoint_callback"] = image_task_service.make_recovery_checkpoint(
+            identity, task_id=new_uuid(), mode="generate", model=body.model, base_url=payload["base_url"])
         return await call.run(openai_v1_image_generations.handle, payload)
 
     @router.post("/v1/images/edits")
@@ -111,7 +115,7 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         transport = config.image_transport
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
-        payload["_image_transport"] = transport
+        payload["_image_transport"] = resolve_image_transport(payload.get("model"), transport)
         prompt = str(payload["prompt"])
         model = str(payload["model"])
         call = LoggedCall(identity, "/v1/images/edits", model, "图生图", request_text=prompt)
@@ -120,13 +124,15 @@ def create_router() -> APIRouter:
         if mask_sources:
             payload["mask"] = await read_image_sources(mask_sources)
         payload["base_url"] = resolve_image_base_url(request)
+        payload["_delivery_checkpoint_callback"] = image_task_service.make_recovery_checkpoint(
+            identity, task_id=new_uuid(), mode="edit", model=model, base_url=payload["base_url"])
         return await call.run(openai_v1_image_edit.handle, payload)
 
     @router.post("/v1/chat/completions")
     async def create_chat_completion(body: ChatCompletionRequest, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
-        payload["_image_transport"] = config.image_transport
+        payload["_image_transport"] = resolve_image_transport(body.model, config.image_transport)
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("prompt"), payload.get("messages"))
         call = LoggedCall(
@@ -144,7 +150,7 @@ def create_router() -> APIRouter:
     async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
-        payload["_image_transport"] = config.image_transport
+        payload["_image_transport"] = resolve_image_transport(body.model, config.image_transport)
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("input"), payload.get("instructions"))
         call = LoggedCall(

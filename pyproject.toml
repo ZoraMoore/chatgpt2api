@@ -5,6 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "cryptography>=46.0.0",
+    "certifi>=2026.10.19",
     "aiortc==1.15.0",
     "quickjs-ng==0.17.0.1",
     "curl-cffi>=0.15.0",

@@ -75,6 +75,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         images=encoded_images,
         message_as_error=True,
         progress_callback=progress_callback,
+        delivery_checkpoint_callback=body.get("_delivery_checkpoint_callback"),
         image_transport=body.get("_image_transport") or config.image_transport,
     ))
     if body.get("stream"):

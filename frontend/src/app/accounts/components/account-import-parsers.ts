@@ -29,6 +29,13 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function withoutLocalImageManagementFields(value: Record<string, unknown>) {
+  // 导出来源的 priority 属于来源元数据；本地生图优先级和周期账本只能由管理接口修改。
+  return Object.fromEntries(Object.entries(value).filter(([key]) =>
+    key !== "image_priority" && !key.startsWith("image_priority_") && !key.startsWith("image_quota_"),
+  ));
+}
+
 export function splitTokens(value: string) {
   return value
     .split(/\r?\n/)
@@ -85,10 +92,12 @@ export function getAccountJsonAccount(
   if (!isPlainObject(value)) {
     return null;
   }
-  const raw = value;
+  const raw = withoutLocalImageManagementFields(value);
   if (typeof raw.platform === "string" && raw.platform !== "openai")
     return null;
-  const credentials = isPlainObject(raw.credentials) ? raw.credentials : null;
+  const credentials = isPlainObject(raw.credentials)
+    ? withoutLocalImageManagementFields(raw.credentials)
+    : null;
   const tokenValue =
     raw.access_token ??
     raw.accessToken ??

@@ -3,7 +3,7 @@ export function createCleanupController({dialog, request, onChange}) {
   const storageKey = 'account-image-cleanup-task';
   const names = {queued:'等待中',scanning:'正在预览',ready:'等待确认',deleting:'正在清理',verifying:'正在复核',running:'正在清理',completed:'已完成',failed:'失败',partial:'部分失败'};
   const state = {id:'',refs:[],all:false,job:null,starting:false,submitting:false,error:'',expired:false};
-  let timer, epoch = 0, pollSequence = 0, executePending = false;
+  let timer, epoch = 0, pollSequence = 0, pollFailures = 0, executePending = false;
   try {
     const saved = JSON.parse(sessionStorage.getItem(storageKey) || 'null');
     if (saved && /^[a-f0-9]{32}$/.test(saved.id)) {
@@ -27,15 +27,16 @@ export function createCleanupController({dialog, request, onChange}) {
   function render() {
     const job = state.job;
     const accounts = Array.isArray(job?.accounts) ? job.accounts : [];
-    const total = accounts.reduce((sum,a) => sum + Number(a.total || 0), 0);
-    const verified = accounts.reduce((sum,a) => sum + Number(a.verified || 0), 0);
+    const eligible = accounts.filter(a => job?.status === 'ready' ? a.phase === 'ready' : a.preview_failed !== true);
+    const total = eligible.reduce((sum,a) => sum + Number(a.total || 0), 0);
+    const verified = eligible.reduce((sum,a) => sum + Number(a.verified || 0), 0);
     const failed = accounts.filter(a => a.phase === 'failed').length;
     let summary = '正在读取原任务进度…';
     if (state.starting) summary = '正在提交预览，后端将逐个扫描所选账号…';
     else if (state.expired) summary = '任务已过期或服务已重启，请重新预览后再确认。';
     else if (!state.id && state.error) summary = '预览未完成，请查看说明后重试。';
     else if (job?.status === 'scanning') summary = `正在预览 ${accounts.length} 个账号，已发现 ${total} 张图片。`;
-    else if (job?.status === 'ready') summary = `预览完成：${accounts.length} 个账号，共 ${total} 张图片。` + (total ? '请核对后确认清理。' : '没有需要清理的图片。');
+    else if (job?.status === 'ready') summary = `预览完成：${accounts.length} 个账号，共 ${total} 张图片。` + (failed ? `${failed} 个账号预览失败，将跳过。` : '') + (total ? '请核对后确认清理。' : '没有需要清理的图片。');
     else if (state.submitting || job?.status === 'running') summary = `正在清理 ${accounts.length} 个账号，已确认移出 ${verified} / ${total} 张图片。`;
     else if (job?.status === 'completed') summary = `清理完成：${accounts.length} 个账号，已确认移出 ${verified} 张图片。`;
     else if (job?.status === 'failed') summary = `预览失败：${failed} 个账号未完成，请查看说明并重新选择账号。`;
@@ -74,21 +75,35 @@ export function createCleanupController({dialog, request, onChange}) {
     dialog.querySelector('.account-op-status').hidden = false;
     dialog.querySelector('#account-operations-title').textContent = '账号操作';
   }
-  async function poll() {
+  async function poll(automatic = false) {
     clearTimeout(timer);
     if (!state.id || executePending) return;
+    if (!automatic) pollFailures = 0;
     const id = state.id, current = epoch, sequence = ++pollSequence;
     try {
       const job = await request('/jobs/' + id);
       if (current !== epoch || id !== state.id || sequence !== pollSequence) return;
-      if (!job || !Array.isArray(job.accounts)) throw new Error('任务进度格式异常，请继续读取');
+      if (!job || !Array.isArray(job.accounts)) {
+        const error = new Error('任务进度格式异常，请继续读取'); error.retryable = true; throw error;
+      }
+      pollFailures = 0;
       state.job = job; state.error = ''; state.expired = false; state.submitting = false;
       render();
-      if (['scanning','running'].includes(job.status)) timer = setTimeout(poll, 1500);
+      if (['scanning','running'].includes(job.status)) timer = setTimeout(() => poll(true), 1500);
     } catch (error) {
       if (current !== epoch || id !== state.id || sequence !== pollSequence) return;
       state.error = error.message; state.submitting = false;
-      if (error.status === 404) { state.id = ''; state.job = null; state.expired = true; persist(); }
+      // 只有业务 API 的 JSON 404 说明任务已过期；代理返回的 HTML 404 不能丢弃原任务。
+      if (error.status === 404 && error.invalidResponse !== true) {
+        state.id = ''; state.job = null; state.expired = true; persist();
+      } else if (error.retryable === true && ![401,403].includes(error.status)) {
+        pollFailures += 1;
+        if (pollFailures <= 6) {
+          const delay = Math.min(1500 * 2 ** (pollFailures - 1), 15000);
+          state.error += `；${delay / 1000} 秒后自动重试读取原任务。`;
+          timer = setTimeout(() => poll(true), delay);
+        } else state.error += '；自动重试已暂停，可点击「继续读取进度」恢复。';
+      }
       render();
     }
   }
@@ -121,7 +136,7 @@ export function createCleanupController({dialog, request, onChange}) {
   }
   $('cleanup-confirm').onchange = render;
   $('cleanup-execute').onclick = execute;
-  $('cleanup-poll').onclick = poll;
+  $('cleanup-poll').onclick = () => poll();
   $('cleanup-repreview').onclick = () => start(state.refs, state.all).catch(error => {state.error=error.message;render();});
   render();
   return {start,show,hide,poll,isActive,hasTask:()=>!!state.id || state.starting || state.expired || !!state.job};

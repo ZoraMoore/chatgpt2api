@@ -6,6 +6,15 @@ from datetime import datetime, timezone
 from typing import Iterator
 
 
+def allows_image_terminal_check(document: object) -> bool:
+    """已观测到状态 4 的会话仍保存完整终态，不能仅凭非空状态拒绝读回。"""
+    if not isinstance(document, dict):
+        return False
+    status = document.get("async_status")
+    # 这里只允许继续检查；最终消息、原轮次及图片产物仍由调用方严格验证。
+    return status is None or type(status) is int and status == 4
+
+
 def conversation_timestamp(value: object) -> float:
     """新版历史列表返回 ISO 时间，旧会话消息仍可能返回 Unix 秒数。"""
     if isinstance(value, bool):

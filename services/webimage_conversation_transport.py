@@ -1,6 +1,7 @@
 """WebImage 普通会话图片协议；不依赖语音消息、上传流程或 WebRTC。
 
 协议参考 239573049/WebImage@c414463237e172796a62f82b521410b1023520df。
+2.6 具名型号参考 a7c926ced41820af30a1d22ca5c79096f0a36d92。
 原项目 MIT 许可及版权声明见 third_party/webimage/LICENSE。
 保留本地 Sentinel 求解、出口时区和终态交付，不引入参考项目的生成 POST 重试。
 """
@@ -13,13 +14,12 @@ import time
 from io import BytesIO
 from urllib.parse import urlsplit
 
-from curl_cffi import CurlOpt
 from curl_cffi.requests.exceptions import RequestException, Timeout
 from PIL import Image
 
 from services.config import config
-from services.protocol.final_image import FinalImageTracker
-from utils.helper import MAX_JSON_IMAGE_BYTES, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.helper import MAX_JSON_IMAGE_BYTES, WEB_IMAGE_26_MODELS, WEB_IMAGE_MODELS, ensure_ok, new_uuid, split_image_model
+from utils.log import logger
 
 
 _CODEX_HEADERS = {"originator", "x-openai-codex-window-type", "x-openai-web-frontend",
@@ -67,11 +67,11 @@ class WebImageConversationTransport:
     @staticmethod
     def model_settings(model):
         _, base = split_image_model(model)
-        # 2.5 是本项目原有公开别名，两者都走 picture_v2 自动路由，不改语音的模型映射。
-        if base not in {"gpt-image-2", "gpt-image-2.5"}:
+        # 旧别名保持自动路由；2.6 是上游具名型号，不能降级为 auto 或文本模型。
+        if base not in WEB_IMAGE_MODELS:
             raise ValueError("unsupported WebImage conversation model")
         effort = str(config.data.get("default_thinking_effort") or "").strip().lower()
-        return "auto", effort if effort in {"standard", "extended", "max"} else ""
+        return base if base in WEB_IMAGE_26_MODELS else "auto", effort if effort in {"standard", "extended", "max"} else ""
 
     def upload(self, value, filename):
         if not isinstance(value, str) or len(value) > MAX_JSON_IMAGE_BYTES * 4 // 3 + 1024:
@@ -133,6 +133,8 @@ class WebImageConversationTransport:
 
     def prepare(self, prompt, requirements, model):
         upstream_model, effort = self.model_settings(model)
+        if upstream_model in WEB_IMAGE_26_MODELS:
+            self.parent_id = "client-created-root"
         path = "/backend-api/f/conversation/prepare"
         payload = {"action": "next", "fork_from_shared_post": False, "parent_message_id": self.parent_id,
                    "model": upstream_model, "client_prepare_state": "success", **self.backend._timezone_fields(),
@@ -148,18 +150,30 @@ class WebImageConversationTransport:
         try:
             ensure_ok(response, path)
             body = response.json()
+            # 上游对具名 2.6 返回 ok/null，WebImage 在此分支省略 conduit 头继续请求。
+            # 只接受明确的成功与 null；缺字段、错误状态、空白或非法令牌仍在生成前失败。
+            if (upstream_model in WEB_IMAGE_26_MODELS and isinstance(body, dict)
+                    and body.get("status") == "ok" and "conduit_token" in body and body["conduit_token"] is None):
+                logger.info({"event": "image_prepare_without_conduit", "model": upstream_model,
+                             "prepare_status": "ok", "conduit_token_present": False})
+                return ""
             return _conduit_token(body.get("conduit_token") if isinstance(body, dict) else None)
         finally:
             response.close()
 
     def payload(self, prompt, model, references):
         upstream_model, effort = self.model_settings(model)
+        named_model = upstream_model in WEB_IMAGE_26_MODELS
+        if named_model:
+            self.parent_id = "client-created-root"
         parts = [{"content_type": "image_asset_pointer", "asset_pointer": f"file-service://{item['file_id']}",
                   "width": item["width"], "height": item["height"], "size_bytes": item["file_size"]}
                  for item in references] + [prompt]
         metadata = {"developer_mode_connector_ids": [], "selected_github_repos": [],
                     "selected_all_github_repos": False, "system_hints": ["picture_v2"],
                     "serialization_metadata": {"custom_symbol_offsets": []}}
+        if named_model:
+            metadata["serialization_metadata"]["render_format"] = "markdown"
         if references:
             metadata["attachments"] = [{"id": item["file_id"], "mimeType": item["mime_type"], "name": item["file_name"],
                                         "size": item["file_size"], "width": item["width"], "height": item["height"]}
@@ -167,7 +181,8 @@ class WebImageConversationTransport:
         payload = {"action": "next", "messages": [{"id": self.message_id, "author": {"role": "user"},
                     "create_time": time.time(), "content": {"content_type": "multimodal_text" if references else "text",
                                                             "parts": parts}, "metadata": metadata}],
-                   "parent_message_id": self.parent_id, "model": upstream_model, "client_prepare_state": "sent",
+                   "parent_message_id": self.parent_id, "model": upstream_model,
+                   "client_prepare_state": "success" if named_model else "sent",
                    **self.backend._timezone_fields(), "conversation_mode": {"kind": "primary_assistant"},
                    "enable_message_followups": True, "system_hints": ["picture_v2"], "supports_buffering": True,
                    "supported_encodings": ["v1"], "client_contextual_info": {"is_dark_mode": False,
@@ -179,47 +194,18 @@ class WebImageConversationTransport:
         return payload
 
     def generate(self, payload, requirements, conduit, timeout):
+        from services.image_generation_stream import stream_image_generation
+
         path = "/backend-api/f/conversation"
-        previous = self.session.curl_options.get(CurlOpt.TIMEOUT_MS)
-        had_timeout = CurlOpt.TIMEOUT_MS in self.session.curl_options
-        self.session.curl_options[CurlOpt.TIMEOUT_MS] = max(1, int(timeout * 1000))
-        response = None
         # 在调用网络之前置位：发送异常不能证明远端未接单，账号层也不得换号重发。
+        from services.image_submission import guard_image_submission
+        guard_image_submission(self.backend)
         self.backend._webimage_generation_sent = True
         self.backend._image_submitted_message_id = self.message_id
-        try:
-            response = self.session.post(self.backend.base_url + path,
-                                         headers=self.headers(path, requirements, conduit, stream=True), json=payload,
-                                         timeout=(30, timeout), stream=True)
-            if not 200 <= response.status_code < 300:
-                body = bytearray()
-                for chunk in response.iter_content():
-                    body.extend(chunk[:65536 - len(body)])
-                    if len(body) >= 65536:
-                        break
-                response.content = bytes(body)
-            ensure_ok(response, path)
-            state = FinalImageTracker()
-            for value in iter_sse_payloads(response):
-                if value == "[DONE]":
-                    yield value
-                    break
-                try:
-                    event = json.loads(value)
-                except ValueError:
-                    event = None
-                if isinstance(event, dict):
-                    state.update(event)
-                    if state.conversation_id:
-                        self.backend.image_conversation_id = state.conversation_id
-                yield value
-        finally:
-            if response is not None:
-                response.close()
-            if had_timeout:
-                self.session.curl_options[CurlOpt.TIMEOUT_MS] = previous
-            else:
-                self.session.curl_options.pop(CurlOpt.TIMEOUT_MS, None)
+        self.backend.image_conversation_id = ""
+        yield from stream_image_generation(
+            self.backend, payload, self.headers(path, requirements, conduit, stream=True), timeout,
+        )
 
 
 def stream_webimage_conversation(backend, prompt, model, images):
@@ -237,6 +223,8 @@ def stream_webimage_conversation(backend, prompt, model, images):
     backend._webimage_generation_sent = False
     backend._report_progress("uploading")
     references = [transport.upload(image, f"image_{index}.png") for index, image in enumerate(images, 1)]
+    # 上传资产永远是输入，即使后续assistant工具参数再次引用也不能作为输出。
+    backend._image_input_asset_ids = [item["file_id"] for item in references]
     backend._report_progress("bootstrapping")
     # 此路径仅需要当前账号 Bearer，不能被旧浏览器实验开关强制要求 sessionToken。
     backend._native_image_sentinel = False
@@ -248,6 +236,7 @@ def stream_webimage_conversation(backend, prompt, model, images):
     backend._report_progress("starting_generation")
     try:
         backend._report_progress("generating")
+        backend._image_delivery_deadline = time.monotonic() + timeout
         yield from transport.generate(transport.payload(prompt, model, references), requirements, conduit, timeout)
     except RequestException as exc:
         # SSE 队列里的墙钟超时是通用 RequestException(code=28)，不总是 Timeout 子类。

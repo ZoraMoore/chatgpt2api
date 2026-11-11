@@ -21,7 +21,8 @@ class AccountOperations:
         return account["management_id"]
 
     def list(self):
-        return [{"id": self.ref(a), "label": a.get("email") or a.get("name") or "未命名账号",
+        return [{"id": self.ref(a), "label": a.get("name") or a.get("email") or "未命名账号",
+                 "refresh_owner": a.get("refresh_owner") or "local",
                  "expires_at": a.get("access_token_expires_at") or "",
                  "has_refresh_token": a.get("has_refresh_token", False),
                  "auto_refresh_token": a.get("auto_refresh_token") is not False,
@@ -61,6 +62,8 @@ class AccountOperations:
 
     def preferences(self, refs, *, image_cleanup_enabled=None, auto_refresh_token=None):
         selected = self.resolve(refs)
+        if auto_refresh_token is True and any(self.accounts.is_sub2api_managed(a) for a in selected):
+            raise ValueError("这些账号由 Sub2API 统一续期，请在连接设置中配置自动同步")
         updates = {}
         for key, value in (("image_cleanup_enabled", image_cleanup_enabled), ("auto_refresh_token", auto_refresh_token)):
             if value is not None:
@@ -93,6 +96,8 @@ class AccountOperations:
             code = ""
             if account is None:
                 code = "account_removed"
+            elif self.accounts.is_sub2api_managed(account):
+                code = "sub2api_managed"
             elif not account.get("refresh_token"):
                 code = "missing_refresh_token"
             else:

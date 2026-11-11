@@ -12,7 +12,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt, field_validator
 
 from services.auth_service import auth_service
 
@@ -70,6 +70,15 @@ class AccountExportRequest(BaseModel):
 
 
 class AccountUpdateRequest(BaseModel):
+    @field_validator("image_priority", "image_priority_mode", mode="before")
+    @classmethod
+    def reject_null_image_policy(cls, value):
+        if value is None:
+            raise ValueError("生图优先级字段不能为null")
+        return value
+
+    image_priority: StrictInt | None = Field(default=None, ge=0, le=1000000)
+    image_priority_mode: Literal["auto", "manual"] | None = None
     access_token: str = ""
     type: str | None = None
     status: str | None = None
@@ -100,6 +109,9 @@ class Sub2APIServerCreateRequest(BaseModel):
     password: str = ""
     api_key: str = ""
     group_id: str = ""
+    totp_secret: str = Field(default="", max_length=2048, repr=False)
+    auto_sync_enabled: bool = False
+    sync_interval_minutes: int = Field(default=5, ge=1, le=1440)
 
 
 class Sub2APIServerUpdateRequest(BaseModel):
@@ -109,6 +121,10 @@ class Sub2APIServerUpdateRequest(BaseModel):
     password: str | None = None
     api_key: str | None = None
     group_id: str | None = None
+    totp_secret: str | None = Field(default=None, max_length=2048, repr=False)
+    clear_totp_secret: bool = False
+    auto_sync_enabled: bool | None = None
+    sync_interval_minutes: int | None = Field(default=None, ge=1, le=1440)
 
 
 class Sub2APIImportRequest(BaseModel):
@@ -391,10 +407,13 @@ def create_router() -> APIRouter:
         access_token = str(body.access_token or "").strip()
         if not access_token:
             raise HTTPException(status_code=400, detail={"error": "access_token is required"})
-        updates = {key: value for key, value in {"type": body.type, "status": body.status, "quota": body.quota, "proxy": body.proxy}.items() if value is not None}
+        updates = {key: value for key, value in {"type": body.type, "status": body.status, "quota": body.quota, "proxy": body.proxy, "image_priority": body.image_priority, "image_priority_mode": body.image_priority_mode}.items() if value is not None}
         if not updates:
             raise HTTPException(status_code=400, detail={"error": "还没有检测到改动，请修改后再保存"})
-        account = account_service.update_account(access_token, updates)
+        try:
+            account = account_service.update_account(access_token, updates)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from None
         if account is None:
             raise HTTPException(status_code=404, detail={"error": "account not found"})
         return {"item": account, "items": account_service.list_accounts()}
@@ -580,20 +599,19 @@ def create_router() -> APIRouter:
         has_api_key = bool(body.api_key.strip())
         if not has_login and not has_api_key:
             raise HTTPException(status_code=400, detail={"error": "email+password or api_key is required"})
-        server = sub2api_config.add_server(
-            name=body.name,
-            base_url=body.base_url,
-            email=body.email,
-            password=body.password,
-            api_key=body.api_key,
-            group_id=body.group_id,
-        )
+        try:
+            server = sub2api_config.add_server(**body.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from None
         return {"server": sanitize_sub2api_server(server), "servers": sanitize_sub2api_servers(sub2api_config.list_servers())}
 
     @router.post("/api/sub2api/servers/{server_id}")
     async def update_sub2api_server(server_id: str, body: Sub2APIServerUpdateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        server = sub2api_config.update_server(server_id, body.model_dump(exclude_none=True))
+        try:
+            server = sub2api_config.update_server(server_id, body.model_dump(exclude_none=True))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from None
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
         return {"server": sanitize_sub2api_server(server), "servers": sanitize_sub2api_servers(sub2api_config.list_servers())}

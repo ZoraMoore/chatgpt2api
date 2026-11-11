@@ -64,6 +64,13 @@ import {
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import { cn } from "@/lib/utils";
 import { AccountImportDialog } from "./components/account-import-dialog";
+import {
+  accountImageQuota,
+  accountImageRecovery,
+  buildImagePriorityUpdate,
+  MAX_IMAGE_PRIORITY,
+  sortAccountsByImagePriority,
+} from "./components/account-presentation";
 
 const statuses: AccountStatus[] = ["正常", "限流", "异常", "禁用"];
 const operationPrefix = "chatgpt2api:account-operations:";
@@ -108,17 +115,6 @@ function beijingTime(value?: string | number | null, short = false) {
     hour12: false,
   }).format(date);
 }
-function restoreTime(value?: string | null) {
-  const date = parseTimestamp(value);
-  if (!date) return { relative: "—", absolute: "" };
-  const hours = Math.max(0, Math.ceil((date.getTime() - Date.now()) / 3600000));
-  return {
-    relative: hours
-      ? `剩余 ${Math.floor(hours / 24)}d ${hours % 24}h`
-      : "已到期",
-    absolute: beijingTime(value),
-  };
-}
 function downloadTokens(accounts: Account[]) {
   const url = URL.createObjectURL(
     new Blob([accounts.map((item) => item.access_token).join("\n")], {
@@ -153,6 +149,8 @@ function AccountsContent() {
   const [editing, setEditing] = useState<Account | null>(null);
   const [editStatus, setEditStatus] = useState<AccountStatus>("正常");
   const [editProxy, setEditProxy] = useState("");
+  const [editImagePriority, setEditImagePriority] = useState("");
+  const [editImagePriorityMode, setEditImagePriorityMode] = useState<Account["image_priority_mode"]>("auto");
   const [testingProxy, setTestingProxy] = useState(false);
   const [deleting, setDeleting] = useState<string[]>([]);
 
@@ -195,10 +193,11 @@ function AccountsContent() {
             loading,
             items: accounts.map((item) => ({
               id: item.account_ref,
-              label: item.email || item.name || "未命名账号",
+              label: item.name || item.email || "未命名账号",
               expires_at: item.access_token_expires_at,
               has_refresh_token: item.has_refresh_token,
               auto_refresh_token: item.auto_refresh_token !== false,
+              refresh_owner: item.refresh_owner,
               image_cleanup_enabled: item.image_cleanup_enabled === true,
               cleanup_next_at: item.image_cleanup_next_at,
               cleanup_last_at: item.image_cleanup_last_at,
@@ -255,13 +254,13 @@ function AccountsContent() {
       disabled: accounts.filter((item) => item.status === "禁用").length,
       quota: accounts
         .filter((item) => item.status === "正常")
-        .reduce((sum, item) => sum + Math.max(0, item.quota), 0),
+        .reduce((sum, item) => sum + accountImageQuota(item).available, 0),
     }),
     [accounts],
   );
   const filtered = useMemo(() => {
     const text = query.trim().toLowerCase();
-    return accounts.filter(
+    return sortAccountsByImagePriority(accounts.filter(
       (item) =>
         (!text ||
           [item.email, item.name, item.user_id, item.access_token].some(
@@ -269,7 +268,7 @@ function AccountsContent() {
           )) &&
         (type === "all" || item.type === type) &&
         (status === "all" || item.status === status),
-    );
+    ));
   }, [accounts, query, type, status]);
   const pageCount = Math.max(1, Math.ceil(filtered.length / Number(pageSize)));
   const safePage = Math.min(page, pageCount);
@@ -395,6 +394,7 @@ function AccountsContent() {
     try {
       const data = await updateAccount(editing.access_token, {
         status: editStatus,
+        ...buildImagePriorityUpdate(editing, editImagePriority, editImagePriorityMode),
         ...(editProxy.trim() !== (editing.proxy ?? "").trim()
           ? { proxy: editProxy.trim() }
           : {}),
@@ -711,7 +711,7 @@ function AccountsContent() {
             </Button>
           </div>
           <div className="overflow-x-auto px-3">
-            <table className="w-full min-w-[1260px] text-left text-xs">
+            <table className="w-full min-w-[1480px] text-left text-xs">
               <thead className="bg-field/70 text-muted-foreground">
                 <tr className="[&>th]:px-3 [&>th]:py-3 [&>th]:font-medium">
                   <th className="w-10">
@@ -743,10 +743,11 @@ function AccountsContent() {
                   <th>类型</th>
                   <th>来源</th>
                   <th>状态</th>
+                  <th title="数字越小越优先；列表在分页前按生图优先级排序">生图优先级 ↑</th>
                   <th>账号信息</th>
                   <th>创建时间</th>
-                  <th>额度</th>
-                  <th>恢复时间</th>
+                  <th>周期额度</th>
+                  <th>冷却 / 周期恢复</th>
                   <th>用途</th>
                   <th>成功</th>
                   <th>失败</th>
@@ -755,7 +756,8 @@ function AccountsContent() {
               </thead>
               <tbody>
                 {currentRows.map((account) => {
-                  const restore = restoreTime(account.restore_at);
+                  const quota = accountImageQuota(account);
+                  const recovery = accountImageRecovery(account);
                   return (
                     <tr
                       data-account-ref={account.account_ref}
@@ -767,7 +769,7 @@ function AccountsContent() {
                     >
                       <td>
                         <Checkbox
-                          aria-label={`选择 ${account.email || "账号"}`}
+                          aria-label={`选择 ${account.name || account.email || "账号"}`}
                           checked={selected.includes(account.access_token)}
                           onCheckedChange={(checked) =>
                             setSelected((current) =>
@@ -826,12 +828,18 @@ function AccountsContent() {
                           {account.status}
                         </span>
                       </td>
+                      <td className="whitespace-nowrap tabular-nums">
+                        <span className="font-medium">{account.image_priority ?? "—"}</span>
+                        <span className="ml-1.5 text-[10px] text-muted-foreground">
+                          {account.image_priority_mode === "manual" ? "手动" : "默认"}
+                        </span>
+                      </td>
                       <td data-account-info>
                         <span
                           className="block max-w-[235px] truncate"
-                          title={account.email || account.name || undefined}
+                          title={account.name || account.email || undefined}
                         >
-                          {account.email || account.name || "—"}
+                          {account.name || account.email || "—"}
                         </span>
                       </td>
                       <td
@@ -840,20 +848,27 @@ function AccountsContent() {
                       >
                         {beijingTime(account.created_at, true)}
                       </td>
-                      <td>
-                        <span className="rounded-md border border-blue-500/15 bg-blue-500/5 px-2 py-1 text-blue-600 dark:text-blue-400">
-                          {Math.max(0, account.quota)}
+                      <td className="whitespace-nowrap tabular-nums">
+                        <span className="inline-block rounded-md border border-blue-500/15 bg-blue-500/5 px-2 py-1 text-blue-600 dark:text-blue-400">
+                          实际可用 {quota.available}
+                        </span>
+                        <span className="mt-1.5 block text-[10px] text-muted-foreground"
+                          title={quota.usedLabel === "未知" ? "缺少完整周期用量基线，保留现有可用额度，不能把已用量当成零。" : undefined}>
+                          上限 {quota.capLabel} · 已用 {quota.usedLabel}
+                        </span>
+                        <span className="mt-0.5 block text-[10px] text-muted-foreground">
+                          预占 {quota.reserved} · 待确认 {quota.uncertain}
                         </span>
                       </td>
                       <td>
                         <span className="block whitespace-nowrap">
-                          {restore.relative}
+                          {recovery.label}
                         </span>
                         <span
                           className="mt-1 block whitespace-nowrap text-[10px] text-muted-foreground"
                           title="北京时间"
                         >
-                          {restore.absolute}
+                          {recovery.at ? beijingTime(recovery.at) : ""}
                         </span>
                       </td>
                       <td className="tabular-nums">
@@ -865,11 +880,13 @@ function AccountsContent() {
                         <Button
                           variant="ghost"
                           size="icon-sm"
-                          aria-label={`编辑 ${account.email || "账号"}`}
+                          aria-label={`编辑 ${account.name || account.email || "账号"}`}
                           onClick={() => {
                             setEditing(account);
                             setEditStatus(account.status);
                             setEditProxy(account.proxy || "");
+                            setEditImagePriority(String(account.image_priority ?? ""));
+                            setEditImagePriorityMode(account.image_priority_mode ?? "auto");
                           }}
                           disabled={working}
                         >
@@ -878,7 +895,7 @@ function AccountsContent() {
                         <Button
                           variant="ghost"
                           size="icon-sm"
-                          aria-label={`刷新 ${account.email || "账号"}`}
+                          aria-label={`刷新 ${account.name || account.email || "账号"}`}
                           onClick={() =>
                             void runAccountJob([account.access_token])
                           }
@@ -889,7 +906,7 @@ function AccountsContent() {
                         <Button
                           variant="ghost"
                           size="icon-sm"
-                          aria-label={`删除 ${account.email || "账号"}`}
+                          aria-label={`删除 ${account.name || account.email || "账号"}`}
                           onClick={() => setDeleting([account.access_token])}
                           disabled={working}
                         >
@@ -1045,10 +1062,47 @@ function AccountsContent() {
           <DialogHeader>
             <DialogTitle>编辑账号</DialogTitle>
             <DialogDescription>
-              {editing?.email || "管理账号状态与专属代理"}
+              {editing?.name || editing?.email || "管理账号状态、生图优先级与专属代理"}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-3">
+                <label htmlFor="account-image-priority" className="text-sm">生图优先级</label>
+                <span className="text-xs text-muted-foreground">
+                  {editImagePriorityMode === "manual" ? "手动设置" : "按套餐默认"}
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <Input
+                  id="account-image-priority"
+                  type="number"
+                  inputMode="numeric"
+                  min={0}
+                  max={MAX_IMAGE_PRIORITY}
+                  step={1}
+                  maxLength={7}
+                  value={editImagePriority}
+                  placeholder="保存后按套餐计算"
+                  onChange={(event) => {
+                    setEditImagePriority(event.target.value);
+                    setEditImagePriorityMode("manual");
+                  }}
+                  aria-describedby="account-image-priority-help"
+                />
+                <Button
+                  variant="outline"
+                  disabled={working || editImagePriorityMode === "auto"}
+                  onClick={() => {
+                    setEditImagePriorityMode("auto");
+                    setEditImagePriority("");
+                  }}
+                >恢复默认</Button>
+              </div>
+              <p id="account-image-priority-help" className="text-xs text-muted-foreground">
+                数字越小越优先，范围 0–1000000。恢复默认后由套餐自动计算；冷却账号仍需等待恢复验证。
+              </p>
+            </div>
             <div className="space-y-2">
               <label className="text-sm">状态</label>
               <Select

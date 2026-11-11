@@ -36,6 +36,7 @@ class FinalImageTests(unittest.TestCase):
 
     def backend(self, payloads=None):
         backend = Mock()
+        backend._image_submitted_message_id = "fixture-submitted"
         backend.stream_conversation.return_value = iter(self.payloads if payloads is None else payloads)
         backend.download_final_sandbox_images.return_value = [png()]
         backend._get_conversation.return_value = {"messages": []}
@@ -60,15 +61,19 @@ class FinalImageTests(unittest.TestCase):
     def test_download_failure_does_not_return_old_image(self):
         backend = self.backend()
         backend.download_final_sandbox_images.side_effect = RuntimeError("download failed")
-        with self.assertRaisesRegex(ImageGenerationError, "最终修正版图片下载失败"):
+        with self.assertRaises(ImageGenerationError) as raised:
             list(stream_image_outputs(backend, ConversationRequest(model="gpt-image-2.5", prompt="测试")))
+        self.assertEqual("image_final_download_failed", raised.exception.code)
+        backend.download_final_sandbox_images.assert_called_once()
         backend.resolve_conversation_image_urls.assert_not_called()
 
     def test_truncated_processing_does_not_return_old_image(self):
         payloads = self.payloads[:8]
         backend = self.backend(payloads)
-        with self.assertRaisesRegex(ImageGenerationError, "尚未完整交付"):
+        with self.assertRaises(ImageGenerationError) as raised:
             list(stream_image_outputs(backend, ConversationRequest(model="gpt-image-2.5", prompt="测试")))
+        self.assertEqual("image_delivery_pending", raised.exception.code)
+        backend.download_final_sandbox_images.assert_not_called()
         backend.resolve_conversation_image_urls.assert_not_called()
 
     def test_final_without_stream_completion_is_not_complete(self):
@@ -78,7 +83,15 @@ class FinalImageTests(unittest.TestCase):
     def test_incomplete_sse_uses_final_message_from_conversation_snapshot(self):
         backend = self.backend([json.dumps({"type": "server_ste_metadata", "conversation_id": "fixture-conversation",
                                            "metadata": {"turn_use_case": "data analysis"}}), "[DONE]"])
-        backend._get_conversation.return_value = {"messages": [{"id": "snapshot-final", "author": {"role": "assistant"},
+        backend._get_conversation.return_value = {"conversation_id": "fixture-conversation", "messages": [
+            {"id": "fixture-submitted", "author": {"role": "user"},
+             "content": {"content_type": "text", "parts": ["synthetic request"]},
+             "status": "finished_successfully", "metadata": {}},
+            {"id": "snapshot-image", "author": {"role": "tool", "name": "synthetic.image"},
+             "content": {"content_type": "multimodal_text", "parts": [
+                 {"content_type": "image_asset_pointer", "asset_pointer": "sediment://file-generated"}]},
+             "status": "finished_successfully", "metadata": {"image_gen_title": "Synthetic image"}},
+            {"id": "snapshot-final", "author": {"role": "assistant"},
             "channel": "final", "content": {"content_type": "text", "parts": ["[PNG](sandbox:/mnt/data/final.png)"]},
             "status": "finished_successfully", "end_turn": True}]}
         with patch("services.protocol.conversation.save_image_bytes", return_value="https://example.test/final.png"):
@@ -91,19 +104,49 @@ class FinalImageTests(unittest.TestCase):
         tool = next(p for p in self.payloads if '"multimodal_text"' in p)
         backend = self.backend([tool, json.dumps({"type": "server_ste_metadata",
                                 "metadata": {"turn_use_case": "data analysis"}}), "[DONE]"])
-        with self.assertRaisesRegex(ImageGenerationError, "尚未完整交付"):
+        with self.assertRaises(ImageGenerationError) as raised:
             list(stream_image_outputs(backend, ConversationRequest(model="gpt-image-2.5")))
+        self.assertEqual("image_delivery_pending", raised.exception.code)
         backend.resolve_conversation_image_urls.assert_not_called()
 
-    def test_plain_image_keeps_original_resolution_flow(self):
+    def test_complete_plain_image_selects_one_final_asset(self):
         tool = next(p for p in self.payloads if '"multimodal_text"' in p)
-        backend = self.backend([tool, "[DONE]"])
-        backend.resolve_conversation_image_urls.return_value = ["https://example.test/original.png"]
+        tool_message = json.loads(tool)["v"]["message"]
+        tool_message["metadata"] = {"image_gen_title": "Synthetic image"}
+        messages = [
+            {"id": "fixture-submitted", "author": {"role": "user"},
+             "content": {"content_type": "text", "parts": ["synthetic request"]},
+             "status": "finished_successfully", "metadata": {}},
+            tool_message,
+            {"id": "plain-final", "author": {"role": "assistant"}, "channel": "final", "recipient": "all",
+             "content": {"content_type": "text", "parts": [""]},
+             "status": "finished_successfully", "end_turn": True, "metadata": {}},
+        ]
+        backend = self.backend([
+            *(json.dumps({"conversation_id": "fixture-conversation", "message": row}) for row in messages),
+            json.dumps({"type": "message_stream_complete"}), "[DONE]",
+        ])
+        backend._resolve_image_urls.return_value = ["https://example.test/original.png"]
         backend.download_image_bytes.return_value = [png()]
         with patch("services.protocol.conversation.save_image_bytes", return_value="https://example.test/original.png"):
             result = list(stream_image_outputs(backend, ConversationRequest(model="gpt-image-2", prompt="测试", response_format="url")))
         self.assertEqual("result", result[-1].kind)
-        backend.resolve_conversation_image_urls.assert_called_once()
+        self.assertEqual(1, len(result[-1].data))
+        backend._resolve_image_urls.assert_called_once_with(
+            "fixture-conversation", [], ["file_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])
+        backend.resolve_conversation_image_urls.assert_not_called()
+        backend._get_conversation.assert_not_called()
+        backend.download_final_sandbox_images.assert_not_called()
+
+    def test_plain_image_without_final_does_not_return_candidate(self):
+        tool = next(p for p in self.payloads if '"multimodal_text"' in p)
+        backend = self.backend([tool, "[DONE]"])
+        with self.assertRaises(ImageGenerationError) as raised:
+            list(stream_image_outputs(backend, ConversationRequest(model="gpt-image-2", prompt="synthetic")))
+        self.assertEqual("image_delivery_pending", raised.exception.code)
+        backend._resolve_image_urls.assert_not_called()
+        backend.resolve_conversation_image_urls.assert_not_called()
+        backend.download_image_bytes.assert_not_called()
         backend.download_final_sandbox_images.assert_not_called()
 
     def test_path_validation_and_encoded_chinese_deduplication(self):

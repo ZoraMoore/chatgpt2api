@@ -15,7 +15,9 @@ from services.firefly import models as firefly_models
 from services.proxy_service import proxy_settings
 from utils.log import logger
 
-WEB_IMAGE_MODELS = {"gpt-image-2", "gpt-image-2.5"}
+# 具名 2.6 型号是上游真实 slug，必须走 Web 会话原样透传。
+WEB_IMAGE_26_MODELS = frozenset({"gpt-image-2.6-sunburst", "gpt-image-2.6-flare"})
+WEB_IMAGE_MODELS = {"gpt-image-2", "gpt-image-2.5"} | WEB_IMAGE_26_MODELS
 IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 BASE_IMAGE_MODELS = WEB_IMAGE_MODELS | {CODEX_IMAGE_MODEL}
@@ -126,6 +128,12 @@ def split_image_model(model: object) -> tuple[str | None, str | None]:
     return None, None
 
 
+def resolve_image_transport(model: object, transport: str) -> str:
+    """新具名型号采用已实现的 Web 协议；旧型号继续使用请求捕获的模式。"""
+    _, base_model = split_image_model(model)
+    return "conversation" if base_model in WEB_IMAGE_26_MODELS else transport
+
+
 def is_firefly_image_model(model: object) -> bool:
     """Adobe Firefly 反代模型（gpt-image- 前缀 + 已登记别名）。
 
@@ -175,12 +183,17 @@ class UpstreamHTTPError(RuntimeError):
         context: str,
         status_code: int,
         body: Any,
-        retry_after: int | None = None,
+        retry_after: int | float | str | None = None,
     ) -> None:
         self.context = context
         self.status_code = status_code
         self.body = body
-        self.retry_after = retry_after
+        from services.image_quota import resolve_retry_after
+
+        observed_at = time.time()
+        deadline = resolve_retry_after(retry_after, now=observed_at)
+        self.retry_at = deadline
+        self.retry_after = max(0.0, deadline - observed_at) if deadline is not None else None
         if isinstance(body, (dict, list)):
             try:
                 body_str = json.dumps(body, ensure_ascii=False)
@@ -202,12 +215,7 @@ def ensure_ok(response: requests.Response, context: str) -> None:
     except Exception:
         pass
     retry_after_header = response.headers.get("Retry-After") if hasattr(response, "headers") else None
-    retry_after: int | None = None
-    if retry_after_header is not None:
-        ra_str = str(retry_after_header).strip()
-        if ra_str.isdigit():
-            retry_after = int(ra_str)
-    raise UpstreamHTTPError(context, response.status_code, body, retry_after=retry_after)
+    raise UpstreamHTTPError(context, response.status_code, body, retry_after=retry_after_header)
 
 
 def sse_json_stream(items) -> Iterator[str]:

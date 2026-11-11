@@ -26,13 +26,13 @@ def get_compatible_admin_response(
     params: dict | None = None,
 ):
     response = session.get(
-        f"{base_url}{path}", headers=headers, params=params, timeout=30,
+        f"{base_url}{path}", headers=headers, params=params, timeout=30, allow_redirects=False,
     )
     alternate_path = _ACCOUNT_PATH_ALIASES.get(path)
     # TokenRouter 将账号接口改名为 providers；只对不存在的接口回退，保留权限错误。
     if response.status_code == 404 and alternate_path:
         response = session.get(
-            f"{base_url}{alternate_path}", headers=headers, params=params, timeout=30,
+            f"{base_url}{alternate_path}", headers=headers, params=params, timeout=30, allow_redirects=False,
         )
     return response
 
@@ -102,6 +102,7 @@ class Sub2APISessionManager:
             json={"email": email, "password": password},
             headers=state.headers,
             timeout=30,
+            allow_redirects=False,
         )
         body = self._response_body(response, "LOGIN_FAILED")
         if not isinstance(body, dict):
@@ -133,6 +134,7 @@ class Sub2APISessionManager:
             json={"temp_token": state.temp_token, "totp_code": code},
             headers=state.headers,
             timeout=30,
+            allow_redirects=False,
         )
         body = self._response_body(response, "LOGIN_2FA_INVALID")
         if not isinstance(body, dict):
@@ -150,6 +152,7 @@ class Sub2APISessionManager:
             json={"code": totp_code},
             headers=self._authorized_headers(state),
             timeout=30,
+            allow_redirects=False,
         )
         body = self._response_body(response, "STEP_UP_INVALID")
         if not isinstance(body, dict) or not bool(body.get("verified")):
@@ -190,6 +193,13 @@ class Sub2APISessionManager:
             state = self._states.pop(_clean(server_id), None)
         if state is not None:
             state.session.close()
+
+    def is_authenticated(self, server_id: str) -> bool:
+        try:
+            self._require_state(server_id)
+            return True
+        except Sub2APISessionError:
+            return False
 
     def _require_state(self, server_id: str, *, require_token: bool = True) -> Sub2APISessionState:
         with self._lock:

@@ -22,13 +22,13 @@
   const rows = () => selectedRefs.map(id => state.items.find(item => item.id === id)).filter(Boolean);
   function quotaDescription(item) {
     if (!item.quota_state) return '';
-    const stages = {cooldown:'冷却等待',awaiting_check:'到期待复查',probe_ready:'等待业务验证',probing:'业务验证中'};
+    const stages = {cooldown:'冷却等待',awaiting_check:'等待再次验证',probe_ready:'等待业务验证',probing:'业务验证中'};
     let value = '图像限流 · ' + (stages[item.quota_state] || '等待恢复') + '\n原因：' + (item.quota_reason || '上游明确报告图像限额') +
       '\n预计恢复（北京时间）：' + formatTime(item.quota_restore_at);
     if (item.status === '禁用') value += '\n账号已人工禁用，不会自动启用。';
-    else if (item.quota_state === 'probe_ready') value += '\n额度查询已通过，等待下一次正常生图请求验证。';
+    else if (item.quota_state === 'probe_ready') value += '\n冷却已到期，等待单次正常生图请求验证恢复。';
     else if (item.quota_state === 'probing') value += '\n仅当前业务请求可验证恢复，其余请求使用其他账号。';
-    else if (item.quota_state === 'awaiting_check') value += '\n到期不代表已恢复，后台复查后仍需业务验证。';
+    else if (item.quota_state === 'awaiting_check') value += '\n冷却或退避到期后，仅允许一个正常生图请求验证恢复。';
     return value;
   }
   function message(value) { text(status, value); }
@@ -59,16 +59,43 @@
   async function api(path, body, scope = 'operations') {
     const credential = await key();
     if (!credential) throw new Error('请先登录管理面板');
-    const response = await fetch('/api/accounts/' + scope + path, {
-      method: body === undefined ? 'GET' : 'POST', headers: {'Authorization':'Bearer ' + credential, 'Content-Type':'application/json'},
-      ...(body === undefined ? {} : {body: JSON.stringify(body)}),
-    });
-    const value = await response.json();
-    if (!response.ok) {
+    const controller = body === undefined ? new AbortController() : null;
+    const timeout = controller ? setTimeout(() => controller.abort(), 15000) : null;
+    let response;
+    try {
+      response = await fetch('/api/accounts/' + scope + path, {
+        method: body === undefined ? 'GET' : 'POST', headers: {'Authorization':'Bearer ' + credential, 'Content-Type':'application/json'},
+        ...(body === undefined ? {signal:controller.signal} : {body:JSON.stringify(body)}),
+      });
       if (response.status === 401) cachedKey = '';
-      const error = new Error(value.detail?.error || '请求失败，请重新登录或稍后重试'); error.status = response.status; throw error;
+      let value;
+      try { value = await response.json(); }
+      catch (parseError) {
+        if (controller?.signal.aborted) throw parseError;
+        // 代理错误页可能返回 HTML；禁止把正文或 JSON 解析器的原始输入片段展示给用户。
+        const error = new Error('服务返回非 JSON 响应（HTTP ' + response.status + '），请稍后重试');
+        error.status = response.status; error.invalidResponse = true;
+        error.retryable = ![401,403].includes(response.status); throw error;
+      }
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        const error = new Error('服务返回的响应格式异常（HTTP ' + response.status + '），请稍后重试');
+        error.status = response.status; error.invalidResponse = true;
+        error.retryable = ![401,403].includes(response.status); throw error;
+      }
+      if (!response.ok) {
+        const detail = typeof value.detail?.error === 'string' ? value.detail.error : '';
+        const error = new Error(detail || '请求失败（HTTP ' + response.status + '），请重新登录或稍后重试');
+        error.status = response.status; error.retryable = response.status >= 500 || [408,429].includes(response.status); throw error;
+      }
+      return value;
+    } catch (error) {
+      if (typeof error.status === 'number') throw error;
+      const failure = new Error(controller?.signal.aborted ? '读取进度超时，请稍后继续读取' : '网络连接异常，请稍后重试');
+      failure.status = response?.status || 0; failure.retryable = ![401,403].includes(failure.status);
+      failure.invalidResponse = true; throw failure;
+    } finally {
+      if (timeout !== null) clearTimeout(timeout);
     }
-    return value;
   }
   function hasStoredCleanup() {
     try { return !!sessionStorage.getItem('account-image-cleanup-task'); } catch (_) { return false; }
@@ -78,7 +105,7 @@
     if (node) node.hidden = !(cleanup?.hasTask() || hasStoredCleanup());
   }
   async function ensureCleanup() {
-    if (!cleanupPromise) cleanupPromise = import('/account-image-cleanup.js?v=f58a63366325').then(module => {
+    if (!cleanupPromise) cleanupPromise = import('/account-image-cleanup.js?v=f30c1b859632').then(module => {
       cleanup = module.createCleanupController({dialog, request:(path,body)=>api(path,body,'image-space'), onChange:taskButton});
       return cleanup;
     }).catch(error=>{cleanupPromise=null;throw error;});
@@ -146,7 +173,9 @@
       const section = document.createElement('section'); section.className = 'account-op-summary';
       const label = document.createElement('strong'); label.textContent = item.label;
       const expiry = document.createElement('div'); expiry.textContent = 'Access Token 到期：' + formatTime(item.expires_at) + '（北京时间）';
-      const refreshState = document.createElement('div'); refreshState.textContent = 'Refresh Token：' + (item.has_refresh_token ? '已保存' : '缺失') + ' · 自动刷新：' + (item.auto_refresh_token ? '开启' : '关闭');
+      const refreshState = document.createElement('div'); refreshState.textContent = item.refresh_owner === 'sub2api'
+        ? '由 Sub2API 统一续期 · 本站仅保存 Access Token'
+        : 'Refresh Token：' + (item.has_refresh_token ? '已保存' : '缺失') + ' · 自动刷新：' + (item.auto_refresh_token ? '开启' : '关闭');
       const cleanup = document.createElement('div'); cleanup.textContent = '自动清理：' + (item.image_cleanup_enabled ? '开启 · 下次 ' + formatTime(item.cleanup_next_at) : '关闭');
       section.append(label, expiry, refreshState, cleanup);
       if (item.quota_state) {
@@ -168,7 +197,7 @@
       button('手动刷新 Access Token', refresh, !available || selected.length > 20 || selected.every(item => !item.has_refresh_token)),
       button('开启每日自动清理（保留 7 天）', () => preferences({image_cleanup_enabled:true}), !available || selected.length > 20),
       button('关闭每日自动清理', () => preferences({image_cleanup_enabled:false}), !available || selected.length > 20),
-      button('开启到期自动刷新', () => preferences({auto_refresh_token:true}), !available || selected.length > 20),
+      button('开启到期自动刷新', () => preferences({auto_refresh_token:true}), !available || selected.length > 20 || selected.some(item => item.refresh_owner === 'sub2api')),
       button('关闭到期自动刷新', () => preferences({auto_refresh_token:false}), !available || selected.length > 20),
     );
   }
@@ -210,7 +239,7 @@
         let expiry = info.querySelector('.account-token-expiry');
         if (!expiry) { expiry = document.createElement('div'); expiry.className = 'account-token-expiry'; info.append(expiry); }
         text(expiry, 'Token 到期：' + formatTime(item.expires_at) + '（北京）\n' +
-          (item.has_refresh_token ? 'RT 已保存' : 'RT 缺失') + ' · 自动刷新' + (item.auto_refresh_token ? '开' : '关') + ' · 自动清理' + (item.image_cleanup_enabled ? '开' : '关'));
+          (item.refresh_owner === 'sub2api' ? 'AT 由 Sub2API 同步 · 不保存 RT' : (item.has_refresh_token ? 'RT 已保存' : 'RT 缺失') + ' · 自动刷新' + (item.auto_refresh_token ? '开' : '关')) + ' · 自动清理' + (item.image_cleanup_enabled ? '开' : '关'));
         let quota = info.querySelector('.account-quota-limit');
         if (item.quota_state) {
           if (!quota) { quota = document.createElement('div'); quota.className = 'account-quota-limit'; info.append(quota); }

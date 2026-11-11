@@ -29,7 +29,10 @@ from services.protocol.web_search_tool import (
     search_query_from_messages,
     text_with_url_citations,
 )
-from utils.helper import extract_image_from_message_content, extract_response_prompt, has_response_image_generation_tool
+from utils.helper import (
+    WEB_IMAGE_26_MODELS, extract_image_from_message_content, extract_response_prompt,
+    has_response_image_generation_tool, split_image_model,
+)
 from utils.image_tokens import (
     count_image_content_tokens,
     count_image_output_items_tokens,
@@ -69,7 +72,9 @@ def thinking_effort_from_body(body: dict[str, Any]) -> str:
 
 
 def is_text_response_request(body: dict[str, Any]) -> bool:
-    return not has_response_image_generation_tool(body)
+    # 2.6 具名图片型号本身已表明生图意图，不能因省略 tools 而送到文本链路。
+    _, image_model = split_image_model(body.get("model"))
+    return image_model not in WEB_IMAGE_26_MODELS and not has_response_image_generation_tool(body)
 
 
 def has_unsupported_response_tools(body: dict[str, Any]) -> bool:

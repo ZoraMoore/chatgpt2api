@@ -9,7 +9,6 @@ import time
 
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from io import BytesIO
@@ -18,7 +17,7 @@ from collections.abc import Callable
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import unquote, urlparse
 
-from curl_cffi import CurlOpt, requests
+from curl_cffi import CurlError, CurlOpt, requests
 from curl_cffi.requests.exceptions import Timeout
 from PIL import Image
 
@@ -27,10 +26,10 @@ from services.browser_sentinel import (BrowserSentinelContext, account_web_sessi
                                        apply_web_session_cookies, browser_sentinel_enabled)
 from services.protocol.conversation_document import conversation_timestamp, iter_conversation_messages
 from services.config import config
-from services.image_quota import ImageQuotaExceeded, detect_document_limit, detect_task_limit, raise_image_quota
+from services.image_quota import ImageQuotaExceeded, detect_document_limit, detect_task_limit, raise_image_quota, image_readback_throttle_evidence_from_http
 from services.egress_timezone import EgressTimezone, egress_timezones
 from services.proxy_service import proxy_settings
-from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, resolve_image_transport, split_image_model
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from utils.turnstile import TurnstileChallengeError, solve_turnstile_token
@@ -313,9 +312,18 @@ class OpenAIBackendAPI:
             raise InvalidAccessTokenError(f"token invalidated ({path})")
         raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
 
+    def _profile_timeout(self) -> float:
+        deadline = getattr(self, "_profile_deadline", None)
+        if type(deadline) not in (int, float):
+            return 20.0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("account profile deadline exceeded")
+        return min(20.0, remaining)
+
     def _get_me(self) -> Dict[str, Any]:
         path = "/backend-api/me"
-        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
+        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=self._profile_timeout())
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()
@@ -332,7 +340,7 @@ class OpenAIBackendAPI:
                 "timezone": self._timezone_fields()["timezone"],
                 "timezone_offset_min": self._timezone_fields()["timezone_offset_min"],
             },
-            timeout=20,
+            timeout=self._profile_timeout(),
         )
         if response.status_code != 200:
             self._raise_on_error(response, path)
@@ -341,42 +349,77 @@ class OpenAIBackendAPI:
     def _get_default_account(self) -> Dict[str, Any]:
         path = "/backend-api/accounts/check/v4-2023-04-27"
         response = self.session.get(self.base_url + path + "?timezone_offset_min=" + str(self._timezone_fields()["timezone_offset_min"]), headers=self._headers(path),
-                                    timeout=20)
+                                    timeout=self._profile_timeout())
         if response.status_code != 200:
             self._raise_on_error(response, path)
         payload = response.json()
-        default_account = ((payload.get("accounts") or {}).get("default") or {}).get("account") or {}
-        logger.debug({
-            "event": "backend_user_info_account_payload",
-            "plan_type": default_account.get("plan_type"),
-            "account_user_role": default_account.get("account_user_role"),
-            "account_id": default_account.get("account_id"),
-            "is_deactivated": default_account.get("is_deactivated"),
-            "has_active_subscription": (payload.get("accounts") or {}).get("default", {}).get("entitlement", {}).get("has_active_subscription"),
-            "subscription_plan": (payload.get("accounts") or {}).get("default", {}).get("entitlement", {}).get("subscription_plan"),
-        })
-        return default_account
+        accounts = payload.get("accounts") if isinstance(payload, dict) else None
+        if not isinstance(accounts, dict):
+            raise RuntimeError("invalid account workspace response")
+        target = self.session.headers.get("ChatGPT-Account-Id")
+        if not target:
+            claims = account_service._decode_jwt_payload(getattr(self, "access_token", ""))
+            auth = claims.get("https://api.openai.com/auth")
+            target = auth.get("chatgpt_account_id") if isinstance(auth, dict) else None
+        if target:
+            if not isinstance(target, str) or not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", target):
+                raise RuntimeError("invalid current account workspace identifier")
+            target = target.casefold()
+            matches = []
+            for key, entry in accounts.items():
+                record = entry.get("account") if isinstance(entry, dict) else None
+                if not isinstance(record, dict):
+                    continue
+                identifier = record.get("account_id")
+                key_matches = isinstance(key, str) and key.casefold() == target
+                id_matches = isinstance(identifier, str) and identifier.casefold() == target
+                if key_matches and identifier and not id_matches:
+                    raise RuntimeError("account workspace identity mismatch")
+                if id_matches or key_matches:
+                    matches.append(record)
+            # default可能是同一用户的个人Free工作区；只认当前凭据在认证响应中的精确身份。
+            if not matches or any(not isinstance(record.get("plan_type"), str) for record in matches):
+                raise RuntimeError("current account workspace is missing or ambiguous")
+            plans = {record["plan_type"] for record in matches}
+            if len(plans) != 1:
+                raise RuntimeError("current account workspace is missing or ambiguous")
+            selected = matches[0]
+        else:
+            entry = accounts.get("default")
+            selected = entry.get("account") if isinstance(entry, dict) else None
+        plan = selected.get("plan_type") if isinstance(selected, dict) else None
+        if not isinstance(plan, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", plan):
+            raise RuntimeError("current account plan type is unavailable")
+        logger.debug({"event": "backend_user_info_account_payload", "plan_type": plan,
+                      "account_user_role": selected.get("account_user_role"),
+                      "is_deactivated": selected.get("is_deactivated"),
+                      "workspace_matched": bool(target)})
+        return dict(selected)
+
+    def get_image_quota(self) -> Dict[str, Any]:
+        """恢复到期时只读取额度元数据，不重复获取身份与套餐资料。"""
+        payload = self._get_conversation_init()
+        rows = payload.get("limits_progress")
+        if not isinstance(rows, list):
+            raise RuntimeError("invalid image quota response")
+        feature = next((r for r in rows if isinstance(r, dict) and r.get("feature_name") == "image_gen"), None)
+        if feature is None or type(feature.get("remaining")) is not int or feature["remaining"] < 0:
+            raise RuntimeError("missing image quota evidence")
+        return {"limits_progress": rows, "quota": feature["remaining"], "restore_at": feature.get("reset_after")}
 
     def get_user_info(self) -> Dict[str, Any]:
         """获取当前 token 的账号信息。"""
         if not self.access_token:
             raise RuntimeError("access_token is required")
-        executor = ThreadPoolExecutor(max_workers=3)
-        try:
-            me_future = executor.submit(self._get_me)
-            init_future = executor.submit(self._get_conversation_init)
-            account_future = executor.submit(self._get_default_account)
-            me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
-        except (KeyboardInterrupt, SystemExit):
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        except BaseException:
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        else:
-            executor.shutdown(wait=True, cancel_futures=True)
+        # curl 会话按线程管理连接；异常 Future 会延迟释放子线程连接，批量失败时耗尽资源。
+        # 复用调用线程的会话，前一步失败立即停止，外层 finally 可及时关闭全部查询连接。
+        me_payload = self._get_me()
+        init_payload = self._get_conversation_init()
+        default_account = self._get_default_account()
 
-        plan_type = str(default_account.get("plan_type") or "free")
+        plan_type = default_account.get("plan_type")
+        if not isinstance(plan_type, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", plan_type):
+            raise RuntimeError("current account plan type is unavailable")
 
         limits_progress = init_payload.get("limits_progress")
         limits_progress = limits_progress if isinstance(limits_progress, list) else []
@@ -895,6 +938,8 @@ class OpenAIBackendAPI:
             },
         })
         try:
+            from services.image_submission import guard_image_submission
+            guard_image_submission(self)
             with urllib.request.urlopen(request, timeout=1200) as raw:
                 yield from self._iter_codex_response_events(raw)
         except urllib.error.HTTPError as error:
@@ -1191,6 +1236,8 @@ class OpenAIBackendAPI:
     def _post_image_conversation(self, payload: Dict[str, Any], requirements: ChatRequirements,
                                  conduit_token: str, timeout_secs: float) -> requests.Response:
         """发起一次网页图片对话请求。"""
+        from services.image_submission import guard_image_submission
+        guard_image_submission(self)
         path = "/backend-api/f/conversation"
         headers = self._image_headers(
             path,
@@ -1257,7 +1304,15 @@ class OpenAIBackendAPI:
             if response.status_code == 404 and index == 0:
                 response.close()
                 continue
-            ensure_ok(response, path)
+            try:
+                ensure_ok(response, path)
+            except UpstreamHTTPError as exc:
+                response.close()
+                if getattr(self, "_image_quota_checks", False) is True:
+                    evidence = image_readback_throttle_evidence_from_http(exc)
+                    if evidence is not None:
+                        raise_image_quota(self, evidence)
+                raise
             return self._inspect_image_quota_document(response.json(), conversation_id)
         raise RuntimeError("conversation lookup failed")
 
@@ -1814,13 +1869,25 @@ class OpenAIBackendAPI:
         target_path.write_bytes(response.content)
         return target_path
 
-    def _resolve_editable_download_url(self, conversation_id: str, artifact: EditableFileArtifact) -> str:
+    def _resolve_editable_download_url(self, conversation_id: str, artifact: EditableFileArtifact,
+                                       *, image_deadline: float | None = None) -> str:
         ids: list[str] = []
         for item in (artifact.attachment_id, artifact.file_id):
             if item and item not in ids:
                 ids.append(item)
         if artifact.sandbox_path and artifact.message_id:
             path = f"/backend-api/conversation/{conversation_id}/interpreter/download"
+            if image_deadline is not None:
+                # 最终图片有独立的短恢复预算，不能改变文档导出的既有行为。
+                response = self._request_final_image_get(
+                    self.base_url + path, "resolve", image_deadline,
+                    headers=self._editable_download_headers(path, conversation_id, "/backend-api/conversation/{conversation_id}/interpreter/download"),
+                    params={"message_id": artifact.message_id, "sandbox_path": artifact.sandbox_path},
+                )
+                try:
+                    return self._download_url_from_response(response)
+                finally:
+                    response.close()
             response = self.session.get(
                 self.base_url + path,
                 headers=self._editable_download_headers(path, conversation_id, "/backend-api/conversation/{conversation_id}/interpreter/download"),
@@ -2544,16 +2611,99 @@ class OpenAIBackendAPI:
         setattr(exc, "conversation_id", conversation_id or "")
         raise exc
 
+    def _image_download_timeout(self, default: float) -> float:
+        deadline = getattr(self, "_image_download_deadline", None)
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            return default
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Timeout("image recovery download budget exhausted")
+        return min(default, remaining)
+
     def _get_file_download_url(self, file_id: str) -> str:
         """获取文件下载地址。"""
         if not isinstance(file_id, str) or not re.fullmatch(r"file[-_][A-Za-z0-9_-]{1,200}", file_id):
             raise ValueError("invalid image file id")
         path = f"/backend-api/files/download/{file_id}"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=self._image_download_timeout(60))
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
+
+    def _request_final_image_get(self, url: str, operation: str, deadline: float, **kwargs):
+        """只重试已确定产物的同一个GET；查询和文件传输共用截止时间。"""
+        if not isinstance(url, str) or len(url) > 8192 or any(ord(c) < 33 for c in url):
+            raise ValueError("invalid final image URL")
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        if (parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in (None, 443)
+                or not (host == "chatgpt.com" or host.endswith(".oaiusercontent.com")
+                        or host.endswith(".blob.core.windows.net"))):
+            raise ValueError("untrusted final image URL")
+        external = host != "chatgpt.com"
+        private_names = {"authorization", "cookie", "chatgpt-account-id"}
+        for attempt in range(1, 4):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Timeout("final image delivery budget exhausted")
+            response = None
+            status = None
+            curl_code = None
+            delay = float(2 ** (attempt - 1))
+            private_headers = ({key: self.session.headers.pop(key) for key in list(self.session.headers)
+                                if key.lower() in private_names} if external else {})
+            # 即使存储URL跳转，也不能将同源鉴权带到另一域名；独占backend会话最终恢复原状态。
+            cookies = getattr(self.session, "cookies", None) if external else None
+            if external:
+                self.session.cookies = requests.Cookies()
+            headers = kwargs.get("headers")
+            clean_kwargs = dict(kwargs)
+            if external and headers:
+                clean_kwargs["headers"] = {k: v for k, v in headers.items() if k.lower() not in private_names}
+            try:
+                try:
+                    response = self.session.get(url, timeout=min(10.0, remaining),
+                                                allow_redirects=False, **clean_kwargs)
+                except CurlError as exc:
+                    curl_code = getattr(exc, "code", None)
+                    logger.warning({"event": "image_final_get_transport_error", "operation": operation,
+                                    "attempt": attempt, "exception_type": type(exc).__name__,
+                                    "curl_code": curl_code})
+                    if curl_code not in {7, 18, 28, 52, 56} or attempt == 3:
+                        raise
+                if response is not None:
+                    status = response.status_code
+                    if 200 <= status < 300:
+                        return response
+                    retryable = status in {429, 500, 502, 503, 504}
+                    retry_after = str(response.headers.get("Retry-After") or "").strip()
+                    if retry_after and len(retry_after) <= 128:
+                        try:
+                            value = float(retry_after)
+                        except ValueError:
+                            try:
+                                value = parsedate_to_datetime(retry_after).timestamp() - time.time()
+                            except (ValueError, TypeError, OverflowError):
+                                value = float("nan")
+                        if math.isfinite(value):
+                            delay = max(0.0, value)
+                    response.close()
+                    logger.warning({"event": "image_final_get_http_error", "operation": operation,
+                                    "attempt": attempt, "status_code": status})
+                    if not retryable or attempt == 3:
+                        raise RuntimeError(f"final image {operation} failed: HTTP {status}")
+            finally:
+                if external:
+                    self.session.headers.update(private_headers)
+                    self.session.cookies = cookies
+            remaining = deadline - time.monotonic()
+            if delay > 5 or delay >= remaining:
+                raise Timeout("final image retry exceeds delivery budget")
+            logger.info({"event": "image_final_get_retry", "operation": operation,
+                         "attempt": attempt, "status_code": status, "curl_code": curl_code,
+                         "sleep_secs": delay})
+            time.sleep(delay)
 
     def download_final_sandbox_images(self, conversation_id: str, message_id: str, paths: list[str]) -> list[bytes]:
         """复用文件导出的沙盒下载协议；失败时不回退到中间图片。"""
@@ -2565,28 +2715,42 @@ class OpenAIBackendAPI:
         if not isinstance(paths, list) or not 1 <= len(paths) <= 10:
             raise ValueError("invalid final image paths")
         validated = list(dict.fromkeys(validated_sandbox_image_path(path) for path in paths))
+        deadline = time.monotonic() + self._image_download_timeout(20.0)
         images = []
         for path in validated:
-            artifact = EditableFileArtifact(sandbox_path=path, message_id=message_id)
-            url = self._resolve_editable_download_url(conversation_id, artifact)
-            if not url or not url.startswith("https://"):
-                raise RuntimeError("final sandbox image download URL unavailable")
-            response = self._request_image_transfer("GET", url, "final_image_download")
-            data = response.content
-            if not data or len(data) > 50 * 1024 * 1024:
-                raise RuntimeError("final sandbox image is empty or exceeds 50MB")
-            with Image.open(BytesIO(data)) as image:
-                if image.format not in {"PNG", "JPEG", "WEBP", "GIF"}:
-                    raise RuntimeError("unsupported final sandbox image format")
-                image.verify()
-            images.append(data)
+            stage = "resolve"
+            try:
+                artifact = EditableFileArtifact(sandbox_path=path, message_id=message_id)
+                url = self._resolve_editable_download_url(conversation_id, artifact, image_deadline=deadline)
+                if not url or not url.startswith("https://"):
+                    raise RuntimeError("final sandbox image download URL unavailable")
+                stage = "download"
+                response = self._request_final_image_get(url, "download", deadline)
+                try:
+                    data = response.content
+                finally:
+                    response.close()
+                stage = "validate"
+                if not data or len(data) > 50 * 1024 * 1024:
+                    raise RuntimeError("final sandbox image is empty or exceeds 50MB")
+                with Image.open(BytesIO(data)) as image:
+                    if image.format not in {"PNG", "JPEG", "WEBP", "GIF"}:
+                        raise RuntimeError("unsupported final sandbox image format")
+                    image.verify()
+                images.append(data)
+            except Exception as exc:
+                logger.warning({"event": "image_final_delivery_failed", "conversation_id": conversation_id,
+                                "stage": stage, "exception_type": type(exc).__name__,
+                                "curl_code": getattr(exc, "code", None),
+                                "elapsed_ms": round((time.monotonic() - deadline + 20.0) * 1000)})
+                raise
         return images
 
     def _get_attachment_download_url(self, conversation_id: str, attachment_id: str) -> str:
         """通过 conversation 附件接口获取下载地址。"""
         path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=self._image_download_timeout(60))
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -2813,9 +2977,12 @@ class OpenAIBackendAPI:
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images = []
         for url in urls:
-            response = self._request_image_transfer("GET", url, "image_download")
+            budget = getattr(self, "_image_download_deadline", None)
+            kwargs = {"timeout_secs": self._image_download_timeout(120.0)} if type(budget) in (int, float) else {}
+            response = self._request_image_transfer("GET", url, "image_download", **kwargs)
             if response.content not in images:
                 images.append(response.content)
+            response.close()
         return images
 
     def stream_conversation(
@@ -2869,7 +3036,10 @@ class OpenAIBackendAPI:
         self.image_conversation_id = ""
         self._image_submitted_message_id = ""
         self._image_turn_trace_id = new_uuid()
-        if (getattr(self, "image_transport", None) or config.image_transport) == "voice":
+        self.image_transport = resolve_image_transport(
+            model, getattr(self, "image_transport", None) or config.image_transport,
+        )
+        if self.image_transport == "voice":
             from services.voice_image_transport import VoiceImageError, stream_voice_image
             # 使用本请求捕获的模式；后台切换不影响已开始的会话，失败后也不重发普通 POST。
             self._egress_timezone = EgressTimezone("America/Los_Angeles", "voice_fixed")

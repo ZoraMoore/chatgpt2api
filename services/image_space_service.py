@@ -98,10 +98,13 @@ class ImageSpaceClient:
                 return {}
             if not 200 <= status < 300:
                 raise ImageSpaceError(f"上游 HTTP {status}，未能完成图像空间操作")
+            content_type = str(response.headers.get("content-type", "")).lower()
+            if "html" in content_type:
+                raise ImageSpaceError(f"上游返回 HTML 页面（HTTP {status}），当前账号已停止，请检查登录状态或代理")
             try:
                 data = response.json()
             except (ValueError, TypeError):
-                raise ImageSpaceError("上游返回了无效 JSON，无法确认结果") from None
+                raise ImageSpaceError(f"上游返回了无效 JSON（HTTP {status}），当前账号已停止，结果未确认") from None
             if not isinstance(data, dict):
                 raise ImageSpaceError("上游响应格式异常，无法确认结果")
             return data
@@ -167,25 +170,36 @@ def clear_snapshot(client, snapshot: dict, update, sleep=time.sleep):
                 ("library_file_id", "file_id", "parent_directory_id", "file_name") if key in item} for item in batch]})
             rows = response.get("files")
             batch_ids = {item["library_file_id"] for item in batch}
+            failure = None
             if isinstance(rows, list):
                 for row in rows:
                     if isinstance(row, dict) and row.get("library_file_id") in batch_ids:
                         code = row.get("status_code")
-                        if row.get("success") is True or (isinstance(code, int) and 200 <= code < 300):
+                        if isinstance(code, int) and code >= 400 and code != 409:
+                            failure = f"上游文件删除失败（HTTP {code}），已停止当前账号"
+                        elif row.get("success") is False and code != 409:
+                            failure = "上游文件删除失败，已停止当前账号"
+                        elif row.get("success") is True or (isinstance(code, int) and 200 <= code < 300):
                             accepted.add(row["library_file_id"])
             elif response.get("success") is True:
                 accepted.update(batch_ids)
+            if response.get("success") is False:
+                failure = failure or "上游批量删除失败，已停止当前账号"
             attempts.update(batch_ids)
             update(attempted=len(attempts), accepted=len(accepted))
+            if failure:
+                raise ImageSpaceError(failure)
             sleep(0.3)
         update(phase="verifying")
-        sleep(20)
-        listed = client.scan()
-        # 仅删除用户确认过的快照，不扩大到任务期间新增的图片。
-        remaining = {key: item for key, item in snapshot.items() if key in listed}
-        update(remaining=len(remaining), verified=len(snapshot) - len(remaining))
-        if not remaining:
-            return
+        # 索引已更新时尽早完成；仍有图片时等待满原有窗口，再考虑重发删除。
+        for delay in ((2, 18) if sweep == 0 else (20,)):
+            sleep(delay)
+            listed = client.scan()
+            # 仅删除用户确认过的快照，不扩大到任务期间新增的图片。
+            remaining = {key: item for key, item in snapshot.items() if key in listed}
+            update(remaining=len(remaining), verified=len(snapshot) - len(remaining))
+            if not remaining:
+                return
     raise ImageSpaceError("复核后仍有图片留在空间，可能删除失败或索引尚未更新；请稍后重新预览")
 
 
@@ -292,8 +306,8 @@ class ImageSpaceService:
         return job_id
 
     def _preview(self, job_id, selected):
-        snapshots = []
-        failed = False
+        # 失败行保留占位，避免后续成功账号的执行进度写到其他账号行。
+        snapshots = [None] * len(selected)
         try:
             for index, account in enumerate(selected):
                 client = None
@@ -301,17 +315,17 @@ class ImageSpaceService:
                     self._update(job_id, index, phase="scanning")
                     client = self.client_factory(account)
                     items = client.scan(lambda count: self._update(job_id, index, total=count))
-                    snapshots.append((account["access_token"], items))
+                    snapshots[index] = (account["access_token"], items)
                     self._update(job_id, index, phase="ready", total=len(items), remaining=len(items))
                 except Exception as exc:
-                    failed = True
-                    self._update(job_id, index, phase="failed", error=self._error(exc))
+                    self._update(job_id, index, phase="failed", preview_failed=True, error=self._error(exc))
                 finally:
                     self._close_client(client)
             with self.lock:
-                if not failed:
+                executable = any(snapshot is not None for snapshot in snapshots)
+                if executable:
                     self.snapshots[job_id] = snapshots
-            self._update(job_id, status="failed" if failed else "ready")
+            self._update(job_id, status="ready" if executable else "failed")
         finally:
             with self.lock:
                 self.active = False
@@ -345,9 +359,12 @@ class ImageSpaceService:
         Thread(target=self._execute, args=(job_id, selected), daemon=True).start()
 
     def _execute(self, job_id, selected):
-        failed = False
+        failed = any(entry is None for entry in selected)
         try:
-            for index, (token, snapshot) in enumerate(selected):
+            for index, entry in enumerate(selected):
+                if entry is None:
+                    continue
+                token, snapshot = entry
                 client = None
                 try:
                     account = self.accounts.get_account(token)

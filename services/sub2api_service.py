@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Lock, RLock
 
 from curl_cffi.requests import Session
 
 from services.account_service import account_service
 from services.config import DATA_DIR
+from services.sub2api_totp import TOTPSecretStore
 from services.sub2api_session_service import (
     Sub2APISessionError,
     get_compatible_admin_response,
@@ -21,6 +24,7 @@ from services.sub2api_session_service import (
 
 
 SUB2API_CONFIG_FILE = DATA_DIR / "sub2api_config.json"
+REMOTE_OPERATION_LOCK = RLock()
 
 def _new_id() -> str:
     return uuid.uuid4().hex[:12]
@@ -64,6 +68,14 @@ def _normalize_server(raw: dict) -> dict:
         "password": _clean(raw.get("password")),
         "api_key": _clean(raw.get("api_key")),
         "group_id": _clean(raw.get("group_id")),
+        "totp_secret_encrypted": _clean(raw.get("totp_secret_encrypted")),
+        "auto_sync_enabled": raw.get("auto_sync_enabled") is True,
+        "sync_interval_minutes": max(1, min(1440, int(raw.get("sync_interval_minutes") or 5))),
+        "last_sync_at": _clean(raw.get("last_sync_at")),
+        "last_sync_error": _clean(raw.get("last_sync_error")),
+        "next_sync_at": float(raw.get("next_sync_at") or 0),
+        "sync_count": int(raw.get("sync_count") or 0),
+        "revision": int(raw.get("revision") or 0),
         "import_job": _normalize_import_job(raw.get("import_job"), fail_unfinished=True),
     }
 
@@ -72,6 +84,7 @@ class Sub2APIConfig:
     def __init__(self, store_file: Path):
         self._store_file = store_file
         self._lock = Lock()
+        self.totp = TOTPSecretStore(store_file.with_name("sub2api_totp.key"))
         self._servers: list[dict] = self._load()
 
     def _load(self) -> list[dict]:
@@ -87,10 +100,12 @@ class Sub2APIConfig:
 
     def _save(self) -> None:
         self._store_file.parent.mkdir(parents=True, exist_ok=True)
-        self._store_file.write_text(
-            json.dumps(self._servers, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        temporary = self._store_file.with_suffix(".tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(self._servers, ensure_ascii=False, indent=2) + "\n")
+        temporary.chmod(0o600)
+        os.replace(temporary, self._store_file)
 
     def list_servers(self) -> list[dict]:
         with self._lock:
@@ -112,6 +127,9 @@ class Sub2APIConfig:
         password: str,
         api_key: str,
         group_id: str = "",
+        totp_secret: str = "",
+        auto_sync_enabled: bool = False,
+        sync_interval_minutes: int = 5,
     ) -> dict:
         server = _normalize_server({
             "id": _new_id(),
@@ -121,7 +139,12 @@ class Sub2APIConfig:
             "password": password,
             "api_key": api_key,
             "group_id": group_id,
+            "auto_sync_enabled": auto_sync_enabled,
+            "sync_interval_minutes": sync_interval_minutes,
         })
+        if totp_secret:
+            server["totp_secret_encrypted"] = self.totp.seal(totp_secret, server)
+        self._validate_auto_sync(server)
         with self._lock:
             self._servers.append(server)
             self._save()
@@ -133,7 +156,18 @@ class Sub2APIConfig:
             for index, server in enumerate(self._servers):
                 if server["id"] != server_id:
                     continue
-                merged = {**server, **{k: v for k, v in updates.items() if v is not None}, "id": server_id}
+                updates = dict(updates)
+                secret = updates.pop("totp_secret", None)
+                clear_secret = updates.pop("clear_totp_secret", False)
+                merged = {**server, **{k: v for k, v in updates.items() if v is not None}, "id": server_id,
+                          "revision": int(server.get("revision") or 0) + 1, "last_sync_error": "", "next_sync_at": 0}
+                if clear_secret:
+                    merged["totp_secret_encrypted"] = ""
+                elif secret:
+                    merged["totp_secret_encrypted"] = self.totp.seal(secret, merged)
+                elif merged.get("totp_secret_encrypted"):
+                    self.totp.open(merged["totp_secret_encrypted"], merged)
+                self._validate_auto_sync(merged)
                 self._servers[index] = _normalize_server(merged)
                 self._save()
                 result = dict(self._servers[index])
@@ -142,6 +176,21 @@ class Sub2APIConfig:
                 return None
         sub2api_session_manager.invalidate(server_id)
         return result
+
+    @staticmethod
+    def _validate_auto_sync(server: dict) -> None:
+        if server.get("auto_sync_enabled") and (not server.get("totp_secret_encrypted") or not server.get("email")
+                                                or not server.get("password") or server.get("api_key")):
+            raise ValueError("自动同步需要管理员邮箱、密码和 2FA 密钥")
+
+    def set_sync_state(self, server_id: str, **fields) -> None:
+        with self._lock:
+            for server in self._servers:
+                if server["id"] == server_id:
+                    server.update({key: value for key, value in fields.items()
+                                   if key in {"last_sync_at", "last_sync_error", "next_sync_at", "sync_count"}})
+                    self._save()
+                    return
 
     def delete_server(self, server_id: str) -> bool:
         with self._lock:
@@ -239,17 +288,37 @@ def _remote_get(server: dict, path: str, *, params: dict | None = None, api_key_
 
 
 def sync_remote_accounts(server: dict) -> dict:
-    if _clean(server.get("api_key")):
+    with REMOTE_OPERATION_LOCK:
+        if _clean(server.get("api_key")):
+            return {"status": "authenticated", "accounts": list_remote_accounts(server)}
+        auth = sub2api_session_manager.begin_login(server)
+        if auth.get("status") == "login_2fa_required":
+            if not server.get("totp_secret_encrypted"):
+                return {**auth, "accounts": []}
+            for attempt in range(2):
+                try:
+                    sub2api_session_manager.complete_login_2fa(server["id"], sub2api_config.totp.next_code(server))
+                    break
+                except Sub2APISessionError as exc:
+                    if attempt or exc.code != "LOGIN_2FA_INVALID" or exc.status_code not in {400, 403}:
+                        raise
         return {"status": "authenticated", "accounts": list_remote_accounts(server)}
-    auth = sub2api_session_manager.begin_login(server)
-    if auth.get("status") == "login_2fa_required":
-        return {**auth, "accounts": []}
-    return {"status": "authenticated", "accounts": list_remote_accounts(server)}
 
 
 def complete_remote_login_2fa(server: dict, totp_code: str) -> dict:
-    sub2api_session_manager.complete_login_2fa(_clean(server.get("id")), totp_code)
-    return {"status": "authenticated", "accounts": list_remote_accounts(server)}
+    with REMOTE_OPERATION_LOCK:
+        sub2api_session_manager.complete_login_2fa(_clean(server.get("id")), totp_code)
+        return {"status": "authenticated", "accounts": list_remote_accounts(server)}
+
+
+def verify_automatic_step_up(server: dict) -> None:
+    for attempt in range(2):
+        try:
+            sub2api_session_manager.verify_step_up(server, sub2api_config.totp.next_code(server))
+            return
+        except Sub2APISessionError as exc:
+            if attempt or exc.code != "STEP_UP_INVALID" or exc.status_code not in {400, 403}:
+                raise
 
 
 def list_remote_accounts(server: dict) -> list[dict]:
@@ -300,11 +369,15 @@ def list_remote_accounts(server: dict) -> list[dict]:
                     "status": _clean(account.get("status")),
                     "expires_at": _clean(credentials.get("expires_at")),
                     "has_refresh_token": bool(_clean(credentials.get("refresh_token"))),
+                    "chatgpt_user_id": _clean(credentials.get("chatgpt_user_id")),
+                    "chatgpt_account_id": _clean(credentials.get("chatgpt_account_id")),
                 })
 
             if page * 200 >= total or len(data) < 200:
                 break
             page += 1
+            if page > 50:
+                raise Sub2APISessionError("SOURCE_TOO_LARGE", "请缩小源站分组范围后再同步", status_code=400)
     finally:
         if session is not None:
             session.close()
@@ -364,8 +437,8 @@ def list_remote_groups(server: dict) -> list[dict]:
     return items
 
 
-def _fetch_accounts_for_import(server: dict, account_ids: list[str]) -> tuple[list[dict], list[dict]]:
-    """保留受保护导出的完整凭据，不能在传给账号池之前降为 token 列表。"""
+def _fetch_accounts_for_import(server: dict, account_ids: list[str], source_accounts: list[dict] | None = None) -> tuple[list[dict], list[dict]]:
+    """通过受保护导出取得当前 AT，续期凭据只在响应内存中短暂出现，不进入本地号池。"""
     ids = [_clean(item) for item in account_ids if _clean(item)]
     if not ids:
         return [], []
@@ -388,9 +461,12 @@ def _fetch_accounts_for_import(server: dict, account_ids: list[str]) -> tuple[li
         raise Sub2APISessionError("UPSTREAM_ERROR", "Sub2API export account IDs are inconsistent")
     if not has_top_level_ids and len(exported_accounts) > len(ids):
         raise Sub2APISessionError("UPSTREAM_ERROR", "Sub2API export returned more accounts than requested")
+    if not has_top_level_ids:
+        source_accounts = source_accounts if source_accounts is not None else list_remote_accounts(server)
 
     imported: list[dict] = []
     errors: list[dict] = []
+    ambiguous_ids: set[str] = set()
     selected_ids = set(ids)
     matched_accounts = 0
     for index, account in enumerate(exported_accounts):
@@ -407,12 +483,63 @@ def _fetch_accounts_for_import(server: dict, account_ids: list[str]) -> tuple[li
             errors.append({"name": account_label, "error": "账号凭据格式无效"})
             continue
         if payload:
+            if not account_id:
+                identity = AccountService._import_identity(payload)
+                candidates = []
+                for source in source_accounts or []:
+                    if _clean(source.get("id")) not in selected_ids:
+                        continue
+                    source_identity = (_clean(source.get("chatgpt_user_id")).lower(), _clean(source.get("chatgpt_account_id")))
+                    same_identity = identity and all(source_identity) and identity == source_identity
+                    same_name = _clean(source.get("name")) == _clean(account.get("name"))
+                    if same_identity or (same_name and not all(source_identity)):
+                        candidates.append(source)
+                exact_names = [source for source in candidates if _clean(source.get("name")) == _clean(account.get("name"))]
+                if len(exact_names) == 1:
+                    candidates = exact_names
+                if len(candidates) != 1:
+                    if candidates:
+                        ambiguous_ids.update(_clean(source.get("id")) for source in candidates)
+                    else:
+                        errors.append({"name": account_label, "error": "无法匹配源站账号 ID"})
+                    continue
+                account_id = _clean(candidates[0].get("id"))
+            payload["sub2api"] = {**payload.get("sub2api", {}), "server_id": server["id"], "id": account_id}
+            payload["last_source_sync_at"] = _now_iso()
             imported.append(payload)
         else:
             errors.append({"name": account_label, "error": "missing access_token"})
 
-    if matched_accounts < len(ids):
-        errors.append({"name": ",".join(ids), "error": f"exported {matched_accounts}/{len(ids)} accounts"})
+    # 源站导出会省略 ID；同名且身份相同的记录必须按单个 ID 再取一次，不能猜测数组顺序。
+    for account_id in sorted(ambiguous_ids):
+        single = sub2api_session_manager.export_accounts(server, [account_id])
+        rows = single.get("accounts") if isinstance(single, dict) else None
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+            errors.append({"name": account_id, "error": "源站单账号导出结果不唯一"})
+            continue
+        raw = rows[0]
+        if raw.get("id") is not None and _clean(raw.get("id")) != account_id:
+            errors.append({"name": account_id, "error": "源站导出账号 ID 不一致"})
+            continue
+        try:
+            payload = AccountService._prepare_account_payload(raw)
+        except ValueError:
+            payload = None
+        if not payload:
+            errors.append({"name": account_id, "error": "账号凭据格式无效"})
+            continue
+        expected = next((item for item in source_accounts or [] if _clean(item.get("id")) == account_id), {})
+        identity = (_clean(expected.get("chatgpt_user_id")).lower(), _clean(expected.get("chatgpt_account_id")))
+        if all(identity) and AccountService._import_identity(payload) != identity:
+            errors.append({"name": account_id, "error": "源站导出账号身份不一致"})
+            continue
+        payload["sub2api"] = {**payload.get("sub2api", {}), "server_id": server["id"], "id": account_id}
+        payload["last_source_sync_at"] = _now_iso()
+        imported.append(payload)
+
+    imported_ids = {item["sub2api"]["id"] for item in imported}
+    if len(imported_ids) < len(selected_ids):
+        errors.append({"name": ",".join(sorted(selected_ids - imported_ids)), "error": f"exported {len(imported_ids)}/{len(selected_ids)} accounts"})
 
     return imported, errors
 
@@ -428,15 +555,25 @@ class Sub2APIImportService:
         self._config = sub2api_config
 
     def start_import(self, server: dict, account_ids: list[str], step_up_code: str) -> dict:
+        with REMOTE_OPERATION_LOCK:
+            return self._start_import(server, account_ids, step_up_code)
+
+    def _start_import(self, server: dict, account_ids: list[str], step_up_code: str) -> dict:
         ids = [_clean(item) for item in account_ids if _clean(item)]
         if not ids or len(ids) > 1000 or any(len(item) > 128 for item in ids):
             raise ValueError("account ids is required")
 
         server_id = _clean(server.get("id"))
         if not _clean(server.get("api_key")):
-            if not _clean(step_up_code):
+            if server.get("totp_secret_encrypted"):
+                # 密钥已配置时，用户无需在每次导入时重复输入验证码。
+                if not sub2api_session_manager.is_authenticated(server_id):
+                    sync_remote_accounts(server)
+                verify_automatic_step_up(server)
+            elif not _clean(step_up_code):
                 raise Sub2APISessionError("STEP_UP_REQUIRED", "Step-up TOTP code is required", status_code=409)
-            sub2api_session_manager.verify_step_up(server, step_up_code)
+            else:
+                sub2api_session_manager.verify_step_up(server, step_up_code)
         accounts, errors = _fetch_accounts_for_import(server, ids)
 
         job = {
@@ -523,3 +660,56 @@ class Sub2APIImportService:
 
 sub2api_config = Sub2APIConfig(SUB2API_CONFIG_FILE)
 sub2api_import_service = Sub2APIImportService(sub2api_config)
+
+
+def sync_source_access_tokens(server: dict) -> dict:
+    """一次完整自动同步；只让源站处理 OAuth 续期，本地只更新最新 AT。"""
+    with REMOTE_OPERATION_LOCK:
+        if sub2api_session_manager.is_authenticated(server["id"]):
+            try:
+                result = {"status": "authenticated", "accounts": list_remote_accounts(server)}
+            except Sub2APISessionError as exc:
+                if exc.code != "SESSION_EXPIRED":
+                    raise
+                result = sync_remote_accounts(server)
+        else:
+            result = sync_remote_accounts(server)
+        if result.get("status") != "authenticated":
+            raise Sub2APISessionError("AUTO_LOGIN_REQUIRED", "请配置管理员 2FA 密钥", status_code=409)
+        sources = result.get("accounts", [])
+        if len(sources) > 1000:
+            raise Sub2APISessionError("SOURCE_TOO_LARGE", "自动同步每个连接最多 1000 个账号，请按分组拆分", status_code=400)
+        if not sources:
+            return {"count": 0, "added": 0, "failed": 0}
+        verify_automatic_step_up(server)
+        accounts, errors = _fetch_accounts_for_import(server, [item["id"] for item in sources], sources)
+        current = sub2api_config.get_server(server["id"])
+        if current is None or current.get("revision") != server.get("revision"):
+            raise Sub2APISessionError("CONFIG_CHANGED", "连接配置已变化，请重新同步", status_code=409)
+        added = account_service.add_account_items(accounts)
+        return {"count": len(accounts), "added": added["added"], "failed": len(errors)}
+
+
+def start_sub2api_sync_scheduler(stop_event) -> threading.Thread:
+    def run():
+        while not stop_event.is_set():
+            for server in sub2api_config.list_servers():
+                if stop_event.is_set():
+                    return
+                if not server.get("auto_sync_enabled") or float(server.get("next_sync_at") or 0) > time.time():
+                    continue
+                interval = int(server.get("sync_interval_minutes") or 5) * 60
+                try:
+                    result = sync_source_access_tokens(server)
+                    sub2api_config.set_sync_state(server["id"], last_sync_at=_now_iso(),
+                        last_sync_error="部分账号无法匹配源站 ID" if result["failed"] else "",
+                        sync_count=result["count"], next_sync_at=time.time() + interval)
+                except Exception as exc:
+                    code = exc.code if isinstance(exc, Sub2APISessionError) else "SYNC_FAILED"
+                    # 错误只保存固定代码，不写出响应正文、密码或验证码。
+                    sub2api_config.set_sync_state(server["id"], last_sync_error=code,
+                        next_sync_at=time.time() + max(interval, 900))
+            stop_event.wait(10)
+    thread = threading.Thread(target=run, name="sub2api-access-token-sync", daemon=True)
+    thread.start()
+    return thread

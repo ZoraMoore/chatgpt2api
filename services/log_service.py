@@ -19,6 +19,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from services.config import DATA_DIR
+from services.image_delivery_trace import get_image_delivery_trace
 from services.protocol.error_response import anthropic_error_response, openai_error_response
 from utils.helper import anthropic_sse_stream, sse_json_stream
 
@@ -474,6 +475,11 @@ class LoggedCall:
             "duration_ms": int((time.time() - self.started) * 1000),
             "status": status,
         }
+        if self.endpoint.startswith("/v1/images"):
+            # 生成成功发生在 HTTP 返回之前，必须与响应发送记录及下游确认区分。
+            detail.update(get_image_delivery_trace())
+            detail["result_scope"] = "generation"
+            suffix = {"调用完成": "生成完成", "流式调用结束": "生成流结束"}.get(suffix, suffix)
         if self.queue_wait_ms is not None:
             detail["queue_wait_ms"] = self.queue_wait_ms
             detail["worker_duration_ms"] = self.worker_duration_ms

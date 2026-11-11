@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -29,10 +31,25 @@ class JSONStorageBackend(StorageBackend):
     @staticmethod
     def _save_json_list(file_path: Path, items: list[dict[str, Any]]) -> None:
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(
-            json.dumps(items, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=file_path.parent,
+                                             prefix=f".{file_path.name}.", delete=False) as stream:
+                temporary = Path(stream.name)
+                json.dump(items, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            # 限流/管理字段与账号同文件提交，避免进程中断留下半份JSON。
+            os.replace(temporary, file_path)
+            directory = os.open(file_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def load_accounts(self) -> list[dict[str, Any]]:
         """从 JSON 文件加载账号数据"""
