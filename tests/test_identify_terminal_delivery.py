@@ -130,12 +130,11 @@ class IdentifyTerminalDeliveryTests(unittest.TestCase):
                         doc['messages'][index]['metadata'][key] = value
                         self.assertIsNone(container_tests.select(doc))
 
-    def test_requires_original_completed_turn_with_empty_final(self):
+    def test_requires_original_completed_turn(self):
         for target, mutation in (
             (2, {'status': 'in_progress'}),
             (3, {'status': 'in_progress'}),
             (-1, {'end_turn': False}),
-            (-1, {'content': {'content_type': 'text', 'parts': ['Still working']}}),
         ):
             with self.subTest(target=target, mutation=mutation):
                 doc = identify_document()
@@ -153,6 +152,15 @@ class IdentifyTerminalDeliveryTests(unittest.TestCase):
         ))
         self.assertIsNone(container_tests.select(doc))
         self.assertIsNone(container_tests.select(identify_document(), expected_final_message_id='other-final'))
+
+    def test_completed_final_may_include_an_ordinary_completion_explanation(self):
+        # V2 契约已允许非空完成说明；终态由本轮身份、消息状态与工具产物共同确认。
+        doc = identify_document()
+        doc['messages'][-1]['content'] = {'content_type': 'text', 'parts': ['已完成']}
+        result = container_tests.select(doc)
+        self.assertIsNotNone(result)
+        self.assertEqual(('container_output', 'container-result', OUTPUT_PATH),
+                         (result.kind, result.message_id, result.path))
 
     def test_never_falls_back_to_earlier_identify_after_new_container_work(self):
         doc = identify_document()

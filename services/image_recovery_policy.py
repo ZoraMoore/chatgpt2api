@@ -11,7 +11,7 @@ AUTO_RETRY_REASONS = frozenset({
     "completion_missing", "document_in_progress", "tool_incomplete", "calls_pending",
     "artifact_missing", "generation_pending", "invalid_branch", "observed_tools_missing",
     "observed_calls_missing", "snapshot_messages_missing", "snapshot_asset_changed",
-    "snapshot_final_regressed", "snapshot_regressed_failure", "readback_unavailable",
+    "snapshot_final_regressed", "snapshot_regressed_failure", "readback_unavailable", "readback_throttled",
     "input_assets_invalid", "missing_submission", "stream_submission_unconfirmed",
     "image_final_download_failed", "original_account_busy", "restart_pending",
 })

@@ -220,7 +220,7 @@ class ImageAutoRecoveryTests(unittest.TestCase):
         self.assertEqual(ACCOUNT_REF, acquire.arguments["account_ref"])
         self.assertEqual(CONVERSATION_ID, acquire.arguments["conversation_id"])
         self.assertLessEqual(acquire.arguments["wait_timeout_secs"], 2)
-        account.release_image_slot.assert_called_once_with("synthetic-token")
+        account.release_image_slot.assert_called_once_with("synthetic-token", resume=True)
         account.mark_image_result.assert_not_called()
         backend.stream_conversation.assert_not_called()
         self.service.generation_handler.assert_not_called()
@@ -239,7 +239,7 @@ class ImageAutoRecoveryTests(unittest.TestCase):
         self.assertEqual(1, task["auto_recovery"]["attempts"])
         self.assertGreater(task["auto_recovery"]["next_poll_at"], self.now)
         self.assertEqual(1, len(self.pool.jobs))
-        account.release_image_slot.assert_called_once_with("synthetic-token")
+        account.release_image_slot.assert_called_once_with("synthetic-token", resume=True)
         self.assertEqual(0, self.service.dispatch_due_recoveries(now=self.now))
         self.assertEqual(1, self.due(key))
 

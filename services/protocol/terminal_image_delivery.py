@@ -378,8 +378,14 @@ def _final_delivery_rejection_reason(message: dict, *, completed: bool = False) 
         text += "\n" + fallback
     text = _direct_completion_text(text)
     # 策略拒绝可能以已结束的 commentary 返回，且不会补齐此前的工具返回。
-    policy_pattern = r"(?:生成的)?(?:图片|图像)[^\n。]{0,100}违反(?:了)?[^\n。]{0,160}(?:防护限制|内容政策|安全政策)"
-    if _direct_refusal_match(policy_pattern, text):
+    policy_patterns = (
+        r"(?:生成的)?(?:图片|图像)[^\n。]{0,100}违反(?:了)?[^\n。]{0,160}(?:防护限制|内容政策|安全政策)",
+        # 实际终态也会以“该提示可能违反了我们的内容政策”拒绝，不能继续等待未返回的工具。
+        # 提示与违反之间仅接受明确肯定表述，避免把“不违反”和普通政策承诺当成拒绝。
+        r"(?:该|此|本次|这次)(?:提示(?:语|词)?|请求)(?:可能|或许|似乎)?违反(?:了)?"
+        r"(?:我们(?:的)?|相关)?(?:内容政策|安全政策)",
+    )
+    if any(_direct_refusal_match(pattern, text) for pattern in policy_patterns):
         return "content_policy_rejected"
     if isinstance(metadata, dict) and (metadata.get("refusal") or metadata.get("is_refusal") is True):
         return "quality_rejected"

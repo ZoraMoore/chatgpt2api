@@ -1357,9 +1357,14 @@ class AccountService:
                     raise ValueError("original image account is no longer available")
                 for token in matches:
                     limit = active_image_limit(self._accounts[token])
-                    if limit and (limit.get("source") == "upstream_http_conversation_throttle"
-                                  or conversation_id and limit.get("conversation_id") == conversation_id):
-                        raise ImageQuotaExceeded(limit)
+                    if limit:
+                        if limit.get("source") == "upstream_http_conversation_throttle":
+                            due_at = max(float(limit.get("restore_at") or 0), float(limit.get("next_check_at") or 0))
+                            if time.time() < due_at:
+                                raise ImageQuotaExceeded(limit)
+                            # 到期仅允许读取既有会话；不解除新生图限流，也不要求先生成另一张图验证。
+                        elif conversation_id and limit.get("conversation_id") == conversation_id:
+                            raise ImageQuotaExceeded(limit)
                     if self._image_inflight.get(token, 0) < max(1, config.image_account_concurrency):
                         self._image_inflight[token] = self._image_inflight.get(token, 0) + 1
                         return token
@@ -1398,7 +1403,14 @@ class AccountService:
                 ref = current.get("management_id", "")
                 with self._lock:
                     refresh_lock = self._image_refresh_locks.setdefault(ref, Lock())
-                if not refresh_lock.acquire(timeout=max(0.0, selection_deadline-time.monotonic())):
+                with self._lock:
+                    alternatives = self._list_ready_candidate_tokens(attempted_tokens, plan_type, source_type, plan_types)
+                remaining_attempts = min(max_attempts-_attempt, 1+len(alternatives))
+                now = time.monotonic()
+                # 总期限仍为15秒；有备选时为每个预检（含锁等待）保留一份剩余时间。
+                # 没有备选时允许唯一账号用完整余量，避免把正常但稍慢的预检提前判失败。
+                preflight_deadline = now + max(0.0, selection_deadline-now) / remaining_attempts
+                if not refresh_lock.acquire(timeout=max(0.0, preflight_deadline-time.monotonic())):
                     raise RuntimeError("image account preflight deadline exceeded")
                 try:
                     fresh = time.monotonic() - self._image_refresh_times.get(ref, float("-inf")) < 60
@@ -1406,7 +1418,7 @@ class AccountService:
                         _, current = self._get_account_for_token(access_token)
                         account = dict(current) if current else {}
                     else:
-                        account = self.fetch_remote_info(access_token, "get_available_access_token", request_deadline=selection_deadline)
+                        account = self.fetch_remote_info(access_token, "get_available_access_token", request_deadline=preflight_deadline)
                         self._image_refresh_times[ref] = time.monotonic()
                         _, raw_account = self._get_account_for_token(str((account or {}).get("access_token") or access_token))
                         account = dict(raw_account) if raw_account else {}
@@ -1822,6 +1834,15 @@ class AccountService:
             account = self._normalize_account({**current, **updates, "access_token": access_token})
             if account is None:
                 return None
+            limit = active_image_limit(account)
+            probe = self._image_probe_leases.get(access_token)
+            if (limit and limit.get("state") == "probing"
+                    and not (probe and probe[0] == limit.get("event_id"))
+                    and not self._image_inflight.get(access_token, 0)):
+                # 历史异常结算可能已经释放验证槽却遗留probing；资料恢复不能让它永久卡住。
+                # 这里只修复无owner且无在途的验证，仍保留异常/禁用与再次验证前的退避。
+                account["image_limit"] = {**limit, "state": "awaiting_check",
+                    "next_check_at": max(float(limit.get("next_check_at") or 0), time.time()+CHECK_RETRY)}
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts and not account.get("image_limit") and not self.is_sub2api_managed(account):
                 self._accounts.pop(access_token, None)
                 self._save_accounts()
@@ -1935,12 +1956,12 @@ class AccountService:
                 return None
             next_item = dict(current)
             limit = active_image_limit(current)
-            own_probe = bool(limit and limit.get("state") == "probing" and lease and lease[0] == limit.get("event_id")
-                             and current.get("status") not in {"禁用", "异常"})
-            # 已提交请求的迟到成功只结算额度，不能撤销随后发生的限流或管理员停用。
-            preserve_status = current.get("status") in {"禁用", "异常", "限流"} and not own_probe
+            own_probe = bool(limit and limit.get("state") == "probing" and lease and lease[0] == limit.get("event_id"))
+            # 所有权结算与账号可用性分开：异常/禁用也须结束本轮验证，但不能借成功撤销停用。
+            unavailable = current.get("status") in {"禁用", "异常"}
+            preserve_status = unavailable or current.get("status") == "限流" and not own_probe
             if own_probe:
-                if success:
+                if success and not unavailable:
                     next_item["image_limit"] = {**limit, "state": "normal", "verified_at": time.time()}
                     recovered = self._image_ledger.view(current["management_id"])
                     # 后面通用成功计数还会减一次原始quota，最终再以账本余额对齐。

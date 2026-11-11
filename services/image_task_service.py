@@ -52,6 +52,29 @@ def _clean(value: object, default: str = "") -> str:
     return str(value or default).strip()
 
 
+_RECOVERY_FAILURE_SOURCES = (
+    "resume_poll", "transport", "upstream_http", "upstream_http_conversation_throttle",
+    "upstream_http_image_throttle", "upstream_http_image_quota", "image_tool_system_error", "assistant_final",
+)
+
+
+def _validated_recovery_failure(value: object) -> dict:
+    # 仅保留定位异常所需的结构字段，异常正文、HTTP上下文和凭据均不得落盘。
+    if not isinstance(value, dict) or value.get("source") not in _RECOVERY_FAILURE_SOURCES:
+        return {}
+    name = value.get("exception_type")
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", name):
+        return {}
+    result = {"source": value["source"], "exception_type": name}
+    status = value.get("status_code")
+    if type(status) is int and 100 <= status <= 599:
+        result["status_code"] = status
+    retry_at = value.get("retry_at")
+    if type(retry_at) in (int, float) and 0 <= retry_at < 253402300800 and math.isfinite(retry_at):
+        result["retry_at"] = retry_at
+    return result
+
+
 def _owner_id(identity: dict[str, object]) -> str:
     return _clean(identity.get("id")) or "anonymous"
 
@@ -272,17 +295,21 @@ class ImageTaskService:
         proof = context.get("observed_evidence") or context.get("completion_receipt")
         return bool(proof and proof.get("conversation_id") == cid)
 
-    def _set_recovery_error_locked(self, task: dict, reason: str, message: str, *, now=None):
+    def _set_recovery_error_locked(self, task: dict, reason: str, message: str, *, now=None, retry_at=None):
         now = time.time() if now is None else now
-        task.update(status=TASK_STATUS_ERROR, error=message, data=[])
+        task.update(status=TASK_STATUS_ERROR, error=message, data=[], updated_ts=now,
+                    updated_at=datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"))
         plan = task.get("auto_recovery")
         if reason in AUTO_RETRY_REASONS and self._has_recovery_identity(task):
             if plan is None:
                 plan = task["auto_recovery"] = recovery_plan(now, reason)
             if (valid_recovery_plan(plan) and plan["state"] not in {"stopped", "completed"}
                     and plan["attempts"] < AUTO_RECOVERY_ATTEMPTS and now < plan["deadline"]):
-                plan.update(state="waiting", last_reason=reason,
-                            next_poll_at=min(plan["deadline"], now + recovery_delay(plan["attempts"])))
+                # 重启及后续错误不得把已持久化的上游冷却提前；等待不占工作槽位。
+                due_at = max(plan["next_poll_at"], now + recovery_delay(plan["attempts"]))
+                if type(retry_at) in (int, float) and 0 <= retry_at < 253402300800 and math.isfinite(retry_at):
+                    due_at = max(due_at, retry_at)
+                plan.update(state="waiting", last_reason=reason, next_poll_at=min(plan["deadline"], due_at))
                 task.update(status=TASK_STATUS_QUEUED, progress="confirming_image", error="")
                 self._recovery_wake.set()
                 return
@@ -785,6 +812,9 @@ class ImageTaskService:
                     plan = recovery_plan(time.time(), "invalid_recovery_plan")
                     plan["state"] = "stopped"
                 task["auto_recovery"] = plan
+            failure = _validated_recovery_failure(item.get("recovery_failure"))
+            if failure:
+                task["recovery_failure"] = failure
             data = item.get("data")
             if isinstance(data, list):
                 task["data"] = data
@@ -878,6 +908,17 @@ class ImageTaskService:
 
     @staticmethod
     def _resume_failure_reason(exc) -> str:
+        from services.image_quota import ImageQuotaExceeded
+        from utils.helper import UpstreamHTTPError
+        if isinstance(exc, ImageQuotaExceeded):
+            return ("readback_throttled" if exc.record.get("source") == "upstream_http_conversation_throttle"
+                    else "image_quota_exceeded")
+        if isinstance(exc, UpstreamHTTPError) and exc.status_code == 429 and re.fullmatch(
+                r"/backend-api/conversations?/[A-Za-z0-9_-]{1,128}", exc.context):
+            return "readback_throttled"
+        if (getattr(exc, "code", None) == "image_request_rate_limited"
+                and ImageTaskService._resume_failure_details(exc).get("source") == "upstream_http_conversation_throttle"):
+            return "readback_throttled"
         for item in getattr(exc, "image_execution", None) or []:
             reason = item.get("selection_reason") if isinstance(item, dict) else None
             if isinstance(reason, str) and re.fullmatch(r"[a-z_]{1,80}", reason):
@@ -886,7 +927,6 @@ class ImageTaskService:
         if isinstance(code, str) and re.fullmatch(r"[a-z_]{1,80}", code):
             return code
         from curl_cffi.requests.exceptions import RequestException
-        from utils.helper import UpstreamHTTPError
         if isinstance(exc, (RequestException, UpstreamHTTPError)):
             return "readback_unavailable"
         if isinstance(exc, RuntimeError) and str(exc) == "original image account is busy; try resuming later":
@@ -894,6 +934,41 @@ class ImageTaskService:
         if isinstance(exc, ValueError) and str(exc) == "original image account is no longer available":
             return "original_account_unavailable"
         return "recovery_interrupted"
+
+    @staticmethod
+    def _resume_failure_details(exc) -> dict:
+        from curl_cffi.requests.exceptions import RequestException
+        from services.image_quota import ImageQuotaExceeded, resolve_image_reset, resolve_retry_after
+        from utils.helper import UpstreamHTTPError
+
+        now = time.time()
+        evidence = exc.record if isinstance(exc, ImageQuotaExceeded) else {}
+        if not evidence:
+            for item in getattr(exc, "image_execution", None) or []:
+                candidate = item.get("image_quota_limit") if isinstance(item, dict) else None
+                if isinstance(candidate, dict) and candidate.get("source") in _RECOVERY_FAILURE_SOURCES:
+                    evidence = candidate
+                    break
+        source = evidence.get("source", "resume_poll")
+        if isinstance(exc, UpstreamHTTPError):
+            source = ("upstream_http_conversation_throttle" if exc.status_code == 429 and re.fullmatch(
+                r"/backend-api/conversations?/[A-Za-z0-9_-]{1,128}", exc.context) else "upstream_http")
+        elif isinstance(exc, RequestException):
+            source = "transport"
+        failure = {"source": source if source in _RECOVERY_FAILURE_SOURCES else "resume_poll",
+                   "exception_type": type(exc).__name__}
+        status = 429 if isinstance(exc, ImageQuotaExceeded) else getattr(exc, "status_code", None)
+        if type(status) is int and 100 <= status <= 599:
+            failure["status_code"] = status
+        retry_values = [resolve_image_reset(value, now=now) for value in (
+            evidence.get("restore_at"), evidence.get("next_check_at"), getattr(exc, "retry_at", None),
+            getattr(exc, "restore_at", None))]
+        if getattr(exc, "retry_at", None) is None:
+            retry_values.append(resolve_retry_after(getattr(exc, "retry_after", None), now=now))
+        retry_values = [value for value in retry_values if value is not None]
+        if retry_values:
+            failure["retry_at"] = max(retry_values)
+        return _validated_recovery_failure(failure)
 
     def _run_resume_poll(
         self, key: str, conversation_id: str, extra_timeout_secs: float,
@@ -977,9 +1052,9 @@ class ImageTaskService:
                                urls=_collect_image_urls(data), conversation_id=conversation_id,
                                image_execution=result.get("_image_execution"))
         except Exception as exc:
-            error_message = str(exc) or "resume poll failed"
             context = _validated_delivery_context(getattr(exc, "delivery_context", None))
             reason = self._resume_failure_reason(exc)
+            failure = self._resume_failure_details(exc)
             with self._lock:
                 if self._resume_leases.get(key) is not lease:
                     return
@@ -995,16 +1070,19 @@ class ImageTaskService:
                         reason = "conversation_mismatch"
                     else:
                         current["delivery_context"] = context
-                self._set_recovery_error_locked(current, reason, error_message)
+                current["recovery_failure"] = failure
+                error_message = "原会话续查失败：" + reason
+                self._set_recovery_error_locked(current, reason, error_message,
+                    retry_at=failure.get("retry_at") if reason == "readback_throttled" else None)
                 current.update(updated_at=_now_iso(), updated_ts=time.time(), duration_ms=int((time.time() - started) * 1000))
                 self._save_locked()
                 stopped = current.get("status") == TASK_STATUS_ERROR
             if auto_recovery:
                 logger.info({"event": "image_recovery_round", "conversation_id": conversation_id,
-                             "reason": reason, "stopped": stopped})
+                             "reason": reason, "stopped": stopped, "failure": failure})
                 if stopped:
                     log_service.add("delivery", "图片后台恢复停止", {"event": "image_recovery_stopped",
-                        "task_id": task["id"], "conversation_id": conversation_id, "reason": reason})
+                        "task_id": task["id"], "conversation_id": conversation_id, "reason": reason, "failure": failure})
             else:
                 self._log_call(identity, mode, model, started, "调用失败（续轮询）", status="failed",
                                error=error_message, conversation_id=conversation_id,
