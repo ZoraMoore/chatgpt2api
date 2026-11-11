@@ -387,6 +387,14 @@ def _final_delivery_rejection_reason(message: dict, *, completed: bool = False) 
     )
     if any(_direct_refusal_match(pattern, text) for pattern in policy_patterns):
         return "content_policy_rejected"
+    # 工具可能不再补返回：本轮明确报错且紧邻声明未交付图片时，不能继续等待或交付已有草图。
+    tool_failure_pattern = (
+        r"(?:本次|当前)(?:图片|图像)(?:生成|编辑|处理)工具(?:发生(?:了)?错误|失败)"
+        r"[，,：:\s]*(?:因此|所以|导致)?未能(?:成功)?(?:输出|生成|交付)"
+        r"[^\n。！？；;]{0,80}(?:图片|图像)"
+    )
+    if _direct_refusal_match(tool_failure_pattern, text):
+        return "generation_failed"
     if isinstance(metadata, dict) and (metadata.get("refusal") or metadata.get("is_refusal") is True):
         return "quality_rejected"
     # “不输出不合格成品”也可能只是质量承诺，必须有本轮实际失败上下文。
